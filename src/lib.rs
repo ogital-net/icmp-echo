@@ -39,13 +39,6 @@ const ICMP6_ECHO_REPLY: u8 = 129;
 const IPPROTO_ICMP: libc::c_int = 1;
 const IPPROTO_ICMPV6: libc::c_int = 58;
 
-/// Check if the current process has permission to create raw sockets.
-/// Returns true if running as root (UID 0), false otherwise.
-#[cfg(test)]
-fn has_raw_socket_permission() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
 struct Socket(i32);
 
 impl Socket {
@@ -209,10 +202,7 @@ struct IcmpHeader {
 impl IcmpHeader {
     fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(
-                (self as *const IcmpHeader).cast::<u8>(),
-                mem::size_of::<IcmpHeader>(),
-            )
+            std::slice::from_raw_parts((self as *const IcmpHeader).cast::<u8>(), IcmpHeader::len())
         }
     }
 
@@ -225,12 +215,12 @@ impl TryFrom<&[u8]> for IcmpHeader {
     type Error = io::Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        if bytes.len() != mem::size_of::<IcmpHeader>() {
+        if bytes.len() != IcmpHeader::len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "Invalid ICMP header size: expected {}, got {}",
-                    mem::size_of::<IcmpHeader>(),
+                    IcmpHeader::len(),
                     bytes.len()
                 ),
             ));
@@ -241,7 +231,7 @@ impl TryFrom<&[u8]> for IcmpHeader {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 header.as_mut_ptr().cast::<u8>(),
-                mem::size_of::<IcmpHeader>(),
+                IcmpHeader::len(),
             );
             Ok(header.assume_init())
         }
@@ -289,10 +279,7 @@ impl Timestamp {
     /// Convert the timestamp to a byte slice.
     fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Timestamp).cast::<u8>(),
-                Timestamp::len(),
-            )
+            std::slice::from_raw_parts((self as *const Timestamp).cast::<u8>(), Timestamp::len())
         }
     }
 
@@ -465,8 +452,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     let sock = create_socket(Domain::Ipv4, timeout)?;
 
     // Build ICMP packet with timestamp
-    let timestamp_size = Timestamp::len();
-    let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
+    let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
@@ -613,8 +599,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let sock = create_socket(Domain::Ipv6, timeout)?;
 
     // Build ICMPv6 packet with timestamp
-    let timestamp_size = Timestamp::len();
-    let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
+    let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
@@ -778,6 +763,12 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check if the current process has permission to create raw sockets.
+    /// Returns true if running as root (UID 0), false otherwise.
+    fn has_raw_socket_permission() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
 
     #[test]
     fn test_checksum() {
