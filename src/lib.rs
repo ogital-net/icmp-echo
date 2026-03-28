@@ -660,7 +660,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Receive response - loop to skip packets that aren't our echo reply
     // (raw sockets receive all ICMP packets, including our own echo request on loopback)
     let recv_time;
-    let mut recv_buf = vec![0u8; 1024];
+    let mut recv_buf = [0u8; 1024];
     let icmp_start;
 
     loop {
@@ -769,7 +769,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Receive response - loop to handle IPv6 raw sockets receiving own packets
     let recv_time;
-    let mut recv_buf = vec![0u8; 1024];
+    let mut recv_buf = [0u8; 1024];
 
     loop {
         let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
@@ -1130,12 +1130,14 @@ mod tests {
         let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
         let timeout = Duration::from_secs(5);
 
-        match send_icmp_echo(dest, &payload, timeout) {
-            Ok(rtt) => {
-                println!("IPv4 2K payload RTT: {:?}", rtt);
-                assert!(rtt < timeout);
+        for i in 0..5 {
+            match send_icmp_echo(dest, &payload, timeout) {
+                Ok(rtt) => {
+                    println!("IPv4 2K payload RTT (packet {}): {:?}", i + 1, rtt);
+                    assert!(rtt < timeout);
+                }
+                Err(e) => panic!("IPv4 2K ping failed on packet {}: {}", i + 1, e),
             }
-            Err(e) => panic!("IPv4 2K ping failed: {}", e),
         }
     }
 
@@ -1150,12 +1152,14 @@ mod tests {
         let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
         let timeout = Duration::from_secs(5);
 
-        match send_icmp_echo(dest, &payload, timeout) {
-            Ok(rtt) => {
-                println!("IPv6 2K payload RTT: {:?}", rtt);
-                assert!(rtt < timeout);
+        for i in 0..5 {
+            match send_icmp_echo(dest, &payload, timeout) {
+                Ok(rtt) => {
+                    println!("IPv6 2K payload RTT (packet {}): {:?}", i + 1, rtt);
+                    assert!(rtt < timeout);
+                }
+                Err(e) => panic!("IPv6 2K ping failed on packet {}: {}", i + 1, e),
             }
-            Err(e) => panic!("IPv6 2K ping failed: {}", e),
         }
     }
 
