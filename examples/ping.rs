@@ -1,4 +1,4 @@
-use icmp_echo::send_icmp_echo;
+use icmp_echo::{IcmpSocket, send_icmp_echo_v4, send_icmp_echo_v6};
 use std::env;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -28,7 +28,24 @@ fn main() {
     let payload = b"Hello from Rust ICMP!";
     let timeout = Duration::from_secs(5);
 
-    match send_icmp_echo(dest, payload, timeout) {
+    let result = match dest {
+        IpAddr::V4(addr) => {
+            let sock = IcmpSocket::new_v4(timeout).unwrap_or_else(|e| {
+                eprintln!("✗ Failed to create socket: {}", e);
+                std::process::exit(1);
+            });
+            send_icmp_echo_v4(&sock, addr, payload)
+        }
+        IpAddr::V6(addr) => {
+            let sock = IcmpSocket::new_v6(timeout).unwrap_or_else(|e| {
+                eprintln!("✗ Failed to create socket: {}", e);
+                std::process::exit(1);
+            });
+            send_icmp_echo_v6(&sock, addr, payload)
+        }
+    };
+
+    match result {
         Ok(rtt) => {
             println!("✓ Reply received!");
             println!("  Round-trip time: {:.3} ms", rtt.as_secs_f64() * 1000.0);

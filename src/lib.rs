@@ -526,7 +526,6 @@ pub fn ping(
     count: usize,
     timeout: Duration,
 ) -> io::Result<(f64, f64)> {
-    // Validate payload size
     if payload_size < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -535,33 +534,54 @@ pub fn ping(
     }
 
     let payload = generate_payload(payload_size - 8);
-
-    // Send echo requests and collect successful RTTs
     let mut rtts = Vec::new();
     let mut failed_count = 0;
 
-    for i in 0..count {
-        match send_icmp_echo(dest, &payload, timeout) {
-            Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0), // Convert to milliseconds
-            Err(_) => failed_count += 1,
+    match dest {
+        IpAddr::V4(addr) => {
+            let sock = IcmpSocket::new_v4(timeout)?;
+            for i in 0..count {
+                match send_icmp_echo_v4(&sock, addr, &payload) {
+                    Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
+                    Err(_) => failed_count += 1,
+                }
+                if i < count - 1 {
+                    #[cfg(feature = "std")]
+                    std::thread::sleep(Duration::from_millis(250));
+                    #[cfg(not(feature = "std"))]
+                    unsafe {
+                        let ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 250_000_000,
+                        };
+                        libc::nanosleep(&ts, core::ptr::null_mut());
+                    }
+                }
+            }
         }
-
-        // Sleep between sends (except after the last one)
-        if i < count - 1 {
-            #[cfg(feature = "std")]
-            std::thread::sleep(Duration::from_millis(250));
-            #[cfg(not(feature = "std"))]
-            unsafe {
-                let ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 250_000_000,
-                };
-                libc::nanosleep(&ts, core::ptr::null_mut());
+        IpAddr::V6(addr) => {
+            let sock = IcmpSocket::new_v6(timeout)?;
+            for i in 0..count {
+                match send_icmp_echo_v6(&sock, addr, &payload) {
+                    Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
+                    Err(_) => failed_count += 1,
+                }
+                if i < count - 1 {
+                    #[cfg(feature = "std")]
+                    std::thread::sleep(Duration::from_millis(250));
+                    #[cfg(not(feature = "std"))]
+                    unsafe {
+                        let ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 250_000_000,
+                        };
+                        libc::nanosleep(&ts, core::ptr::null_mut());
+                    }
+                }
             }
         }
     }
 
-    // Check if all requests failed
     if rtts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -569,47 +589,13 @@ pub fn ping(
         ));
     }
 
-    // Calculate average RTT
     let sum: f64 = rtts.iter().sum();
     #[allow(clippy::cast_precision_loss)]
     let avg = sum / rtts.len() as f64;
-
-    // Calculate packet loss percentage
     #[allow(clippy::cast_precision_loss)]
     let packet_loss = (failed_count as f64 / count as f64) * 100.0;
 
     Ok((avg, packet_loss))
-}
-
-/// Send an ICMP echo request with the given payload and return the round-trip time.
-///
-/// # Arguments
-/// * `dest` - Destination IPv4 or IPv6 address
-/// * `payload` - Arbitrary payload data to include in the ICMP packet
-/// * `timeout` - Maximum time to wait for a reply
-///
-/// # Returns
-/// * `Ok(Duration)` - Round-trip time if reply received
-/// * `Err(io::Error)` - If socket operations fail or timeout occurs
-///
-/// # Errors
-/// Returns an error if socket operations fail, timeout occurs, or reply validation fails.
-///
-/// # Notes
-/// This function requires raw socket permissions (typically root/admin).
-/// For `IPv6` destinations, sends `ICMPv6` echo requests.
-/// For `IPv4` destinations, sends ICMP echo requests.
-pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    match dest {
-        IpAddr::V4(addr) => {
-            let sock = IcmpSocket::new_v4(timeout)?;
-            send_icmp_echo_v4(&sock, addr, payload)
-        }
-        IpAddr::V6(addr) => {
-            let sock = IcmpSocket::new_v6(timeout)?;
-            send_icmp_echo_v6(&sock, addr, payload)
-        }
-    }
 }
 
 fn sendto(sock: &IcmpSocket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
@@ -1084,27 +1070,6 @@ mod async_impl {
         }
     }
 
-    /// Async version of [`send_icmp_echo`](super::send_icmp_echo).
-    ///
-    /// Sends an ICMP echo request and returns the round-trip time.
-    /// Requires a tokio runtime. Requires raw socket permissions.
-    pub async fn send_icmp_echo_async(
-        dest: IpAddr,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> io::Result<Duration> {
-        match dest {
-            IpAddr::V4(addr) => {
-                let afd = IcmpSocket::new_v4(timeout)?.into_async()?;
-                send_icmp_echo_v4_async(&afd, addr, payload, timeout).await
-            }
-            IpAddr::V6(addr) => {
-                let afd = IcmpSocket::new_v6(timeout)?.into_async()?;
-                send_icmp_echo_v6_async(&afd, addr, payload, timeout).await
-            }
-        }
-    }
-
     /// Async version of [`ping`](super::ping).
     ///
     /// Sends `count` ICMP echo requests and returns `(avg_rtt_ms, packet_loss_pct)`.
@@ -1129,13 +1094,30 @@ mod async_impl {
         let mut rtts = Vec::new();
         let mut failed_count = 0usize;
 
-        for i in 0..count {
-            match send_icmp_echo_async(dest, &payload, timeout).await {
-                Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
-                Err(_) => failed_count += 1,
+        match dest {
+            IpAddr::V4(addr) => {
+                let afd = IcmpSocket::new_v4(timeout)?.into_async()?;
+                for i in 0..count {
+                    match send_icmp_echo_v4_async(&afd, addr, &payload, timeout).await {
+                        Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
+                        Err(_) => failed_count += 1,
+                    }
+                    if i < count - 1 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
             }
-            if i < count - 1 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            IpAddr::V6(addr) => {
+                let afd = IcmpSocket::new_v6(timeout)?.into_async()?;
+                for i in 0..count {
+                    match send_icmp_echo_v6_async(&afd, addr, &payload, timeout).await {
+                        Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
+                        Err(_) => failed_count += 1,
+                    }
+                    if i < count - 1 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
             }
         }
 
@@ -1157,7 +1139,7 @@ mod async_impl {
 }
 
 #[cfg(feature = "tokio")]
-pub use async_impl::{ping_async, send_icmp_echo_async, send_icmp_echo_v4_async, send_icmp_echo_v6_async};
+pub use async_impl::{ping_async, send_icmp_echo_v4_async, send_icmp_echo_v6_async};
 
 #[cfg(test)]
 mod tests {
@@ -1342,11 +1324,12 @@ mod tests {
             return;
         }
 
-        let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let addr = Ipv4Addr::new(127, 0, 0, 1);
         let payload = b"test payload";
         let timeout = Duration::from_secs(5);
+        let sock = IcmpSocket::new_v4(timeout).expect("failed to create socket");
 
-        match send_icmp_echo(dest, payload, timeout) {
+        match send_icmp_echo_v4(&sock, addr, payload) {
             Ok(rtt) => {
                 println!("IPv4 RTT: {:?}", rtt);
                 assert!(rtt < timeout);
@@ -1365,11 +1348,12 @@ mod tests {
             return;
         }
 
-        let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
         let payload = b"test payload";
         let timeout = Duration::from_secs(5);
+        let sock = IcmpSocket::new_v6(timeout).expect("failed to create socket");
 
-        match send_icmp_echo(dest, payload, timeout) {
+        match send_icmp_echo_v6(&sock, addr, payload) {
             Ok(rtt) => {
                 println!("IPv6 RTT: {:?}", rtt);
                 assert!(rtt < timeout);
@@ -1422,12 +1406,13 @@ mod tests {
             return;
         }
 
-        let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let addr = Ipv4Addr::new(127, 0, 0, 1);
         let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
         let timeout = Duration::from_secs(5);
+        let sock = IcmpSocket::new_v4(timeout).expect("failed to create socket");
 
         for i in 0..5 {
-            match send_icmp_echo(dest, &payload, timeout) {
+            match send_icmp_echo_v4(&sock, addr, &payload) {
                 Ok(rtt) => {
                     println!("IPv4 2K payload RTT (packet {}): {:?}", i + 1, rtt);
                     assert!(rtt < timeout);
@@ -1444,12 +1429,13 @@ mod tests {
             return;
         }
 
-        let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
         let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
         let timeout = Duration::from_secs(5);
+        let sock = IcmpSocket::new_v6(timeout).expect("failed to create socket");
 
         for i in 0..5 {
-            match send_icmp_echo(dest, &payload, timeout) {
+            match send_icmp_echo_v6(&sock, addr, &payload) {
                 Ok(rtt) => {
                     println!("IPv6 2K payload RTT (packet {}): {:?}", i + 1, rtt);
                     assert!(rtt < timeout);
@@ -1475,15 +1461,15 @@ mod tests {
 
         for _ in 0..THREAD_COUNT {
             let barrier = Arc::clone(&barrier);
-            let handle = thread::spawn(move || {
+            let handle = thread::spawn(move || -> io::Result<Duration> {
                 // All threads start sending at the same time
                 barrier.wait();
 
-                let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+                let addr = Ipv4Addr::new(127, 0, 0, 1);
                 let payload = b"threaded ping";
                 let timeout = Duration::from_secs(5);
-
-                send_icmp_echo(dest, payload, timeout)
+                let sock = IcmpSocket::new_v4(timeout)?;
+                send_icmp_echo_v4(&sock, addr, payload)
             });
             handles.push(handle);
         }
@@ -1521,15 +1507,15 @@ mod tests {
 
         for _ in 0..THREAD_COUNT {
             let barrier = Arc::clone(&barrier);
-            let handle = thread::spawn(move || {
+            let handle = thread::spawn(move || -> io::Result<Duration> {
                 // All threads start sending at the same time
                 barrier.wait();
 
-                let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+                let addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
                 let payload = b"threaded ping";
                 let timeout = Duration::from_secs(5);
-
-                send_icmp_echo(dest, payload, timeout)
+                let sock = IcmpSocket::new_v6(timeout)?;
+                send_icmp_echo_v6(&sock, addr, payload)
             });
             handles.push(handle);
         }
@@ -1554,7 +1540,7 @@ mod tests {
     #[cfg(feature = "tokio")]
     mod async_tests {
         use super::*;
-        use crate::{ping_async, send_icmp_echo_async};
+        use crate::{ping_async, send_icmp_echo_v4_async, send_icmp_echo_v6_async};
 
         #[tokio::test]
         async fn test_send_icmp_echo_async_v4() {
@@ -1562,8 +1548,12 @@ mod tests {
                 println!("Skipping test_send_icmp_echo_async_v4: requires root privileges");
                 return;
             }
-            let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-            let rtt = send_icmp_echo_async(dest, b"async test", Duration::from_secs(5))
+            let dest = Ipv4Addr::new(127, 0, 0, 1);
+            let afd = IcmpSocket::new_v4(Duration::from_secs(5))
+                .unwrap()
+                .into_async()
+                .unwrap();
+            let rtt = send_icmp_echo_v4_async(&afd, dest, b"async test", Duration::from_secs(5))
                 .await
                 .expect("async ICMPv4 ping failed");
             println!("async IPv4 RTT: {:?}", rtt);
@@ -1576,8 +1566,12 @@ mod tests {
                 println!("Skipping test_send_icmp_echo_async_v6: requires root privileges");
                 return;
             }
-            let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
-            let rtt = send_icmp_echo_async(dest, b"async test", Duration::from_secs(5))
+            let dest = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1);
+            let afd = IcmpSocket::new_v6(Duration::from_secs(5))
+                .unwrap()
+                .into_async()
+                .unwrap();
+            let rtt = send_icmp_echo_v6_async(&afd, dest, b"async test", Duration::from_secs(5))
                 .await
                 .expect("async ICMPv6 ping failed");
             println!("async IPv6 RTT: {:?}", rtt);
