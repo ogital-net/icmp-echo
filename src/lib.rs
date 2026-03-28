@@ -39,6 +39,13 @@ const ICMP6_ECHO_REPLY: u8 = 129;
 const IPPROTO_ICMP: libc::c_int = 1;
 const IPPROTO_ICMPV6: libc::c_int = 58;
 
+/// Check if the current process has permission to create raw sockets.
+/// Returns true if running as root (UID 0), false otherwise.
+#[cfg(test)]
+fn has_raw_socket_permission() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct IcmpHeader {
@@ -496,43 +503,46 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         }
     }
 
-    // Set Do Not Fragment bit for IPv6
+    // Tell kernel to calculate ICMPv6 checksum (Linux only)
+    // Note: On macOS/BSD, the kernel automatically calculates ICMPv6 checksums
+    // and the IPV6_CHECKSUM socket option is not supported
+    #[cfg(target_os = "linux")]
     unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let val: libc::c_int = libc::IPV6_PMTUDISC_DO;
-            if libc::setsockopt(
-                sock,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_MTU_DISCOVER,
-                (&raw const val).cast::<libc::c_void>(),
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    mem::size_of::<libc::c_int>() as libc::socklen_t
-                },
-            ) < 0
+        let offset: libc::c_int = 2;
+        if libc::setsockopt(
+            sock,
+            IPPROTO_ICMPV6,
+            libc::IPV6_CHECKSUM,
+            (&raw const offset).cast::<libc::c_void>(),
+            #[allow(clippy::cast_possible_truncation)]
             {
-                libc::close(sock);
-                return Err(io::Error::last_os_error());
-            }
+                mem::size_of::<libc::c_int>() as libc::socklen_t
+            },
+        ) < 0
+        {
+            libc::close(sock);
+            return Err(io::Error::last_os_error());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let val: libc::c_int = 1;
-            if libc::setsockopt(
-                sock,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_DONTFRAG,
-                (&raw const val).cast::<libc::c_void>(),
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    mem::size_of::<libc::c_int>() as libc::socklen_t
-                },
-            ) < 0
+    }
+
+    // Set Do Not Fragment bit for IPv6 (Linux only)
+    // Note: macOS/BSD don't support IPV6_DONTFRAG for raw sockets
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let val: libc::c_int = libc::IPV6_PMTUDISC_DO;
+        if libc::setsockopt(
+            sock,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            (&raw const val).cast::<libc::c_void>(),
+            #[allow(clippy::cast_possible_truncation)]
             {
-                libc::close(sock);
-                return Err(io::Error::last_os_error());
-            }
+                mem::size_of::<libc::c_int>() as libc::socklen_t
+            },
+        ) < 0
+        {
+            libc::close(sock);
+            return Err(io::Error::last_os_error());
         }
     }
 
@@ -613,66 +623,64 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         return Err(io::Error::last_os_error());
     }
 
-    // Receive response
+    // Receive response - loop to handle IPv6 raw sockets receiving own packets
+    let our_id = get_thread_id();
+    let recv_time;
     let mut recv_buf = vec![0u8; 1024];
-    let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
-    #[allow(clippy::cast_possible_truncation)]
-    let mut src_addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    
+    loop {
+        let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+        #[allow(clippy::cast_possible_truncation)]
+        let mut src_addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
 
-    let received = unsafe {
-        libc::recvfrom(
-            sock,
-            recv_buf.as_mut_ptr().cast::<libc::c_void>(),
-            recv_buf.len(),
-            0,
-            (&raw mut src_addr).cast::<libc::sockaddr>(),
-            &raw mut src_addr_len,
-        )
-    };
+        let received = unsafe {
+            libc::recvfrom(
+                sock,
+                recv_buf.as_mut_ptr().cast::<libc::c_void>(),
+                recv_buf.len(),
+                0,
+                (&raw mut src_addr).cast::<libc::sockaddr>(),
+                &raw mut src_addr_len,
+            )
+        };
+
+        if received < 0 {
+            unsafe { libc::close(sock) };
+            return Err(io::Error::last_os_error());
+        }
+
+        // Parse ICMPv6 response (no IP header for ICMPv6 raw sockets)
+        #[allow(clippy::cast_sign_loss)]
+        if (received as usize) < 8 {
+            continue; // Too short, wait for next packet
+        }
+
+        // Parse ICMPv6 header from response
+        let reply_type = recv_buf[0];
+        let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
+
+        // Skip packets that aren't echo replies or aren't for us
+        if reply_type != ICMP6_ECHO_REPLY {
+            continue; // Not an echo reply, wait for next packet
+        }
+        
+        if reply_id != our_id {
+            continue; // Not our packet, wait for next packet
+        }
+
+        // Found our echo reply!
+        recv_time = get_monotonic_time()?;
+        break;
+    }
 
     unsafe { libc::close(sock) };
-
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Get current monotonic time for RTT calculation
-    let recv_time = get_monotonic_time()?;
-
-    // Parse ICMPv6 response (no IP header for ICMPv6 raw sockets)
-    #[allow(clippy::cast_sign_loss)]
-    if (received as usize) < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Response too short",
-        ));
-    }
-
-    // Parse ICMPv6 header from response
-    let reply_type = recv_buf[0];
-    let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
-
-    // Verify this is our echo reply
-    if reply_type != ICMP6_ECHO_REPLY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected ICMPv6 type: {reply_type}"),
-        ));
-    }
-
-    if reply_id != get_thread_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMPv6 ID mismatch",
-        ));
-    }
 
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = 8; // After ICMPv6 header (no IP header for IPv6)
     let timestamp_size = mem::size_of::<Timestamp>();
 
-    #[allow(clippy::cast_sign_loss)]
-    if (received as usize) >= timestamp_offset + timestamp_size {
+    // Extract timestamp from packet
+    if recv_buf.len() >= timestamp_offset + timestamp_size {
         let mut ts = Timestamp { sec: 0, nsec: 0 };
         unsafe {
             let ts_bytes =
@@ -882,8 +890,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires root privileges
     fn test_ping_localhost_v4() {
+        // Skip test if not running as root
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_localhost_v4: requires root privileges");
+            return;
+        }
+
         let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let payload = b"test payload";
         let timeout = Duration::from_secs(5);
@@ -894,15 +907,19 @@ mod tests {
                 assert!(rtt < timeout);
             }
             Err(e) => {
-                eprintln!("IPv4 Ping failed: {}", e);
-                // This test may fail without proper permissions
+                panic!("IPv4 Ping failed: {}", e);
             }
         }
     }
 
     #[test]
-    #[ignore] // Requires root privileges
     fn test_ping_localhost_v6() {
+        // Skip test if not running as root
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_localhost_v6: requires root privileges");
+            return;
+        }
+
         let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
         let payload = b"test payload";
         let timeout = Duration::from_secs(5);
@@ -913,8 +930,7 @@ mod tests {
                 assert!(rtt < timeout);
             }
             Err(e) => {
-                eprintln!("IPv6 Ping failed: {}", e);
-                // This test may fail without proper permissions
+                panic!("IPv6 Ping failed: {}", e);
             }
         }
     }
@@ -929,8 +945,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires root privileges
     fn test_ping_localhost() {
+        // Skip test if not running as root
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_localhost: requires root privileges");
+            return;
+        }
+
         // Test the ping helper function with localhost
         let dest = "127.0.0.1".parse().unwrap();
         match ping(dest, 56, 3) {
@@ -938,11 +959,10 @@ mod tests {
                 println!("Average RTT: {:.3} ms, Packet Loss: {:.1}%", avg_rtt, packet_loss);
                 assert!(avg_rtt > 0.0);
                 assert!(avg_rtt < 1000.0); // Should be less than 1 second
-                assert!(packet_loss >= 0.0 && packet_loss <= 100.0);
+                assert!((0.0..=100.0).contains(&packet_loss));
             }
             Err(e) => {
-                eprintln!("Ping failed: {}", e);
-                // This test may fail without proper permissions
+                panic!("Ping failed: {}", e);
             }
         }
     }
