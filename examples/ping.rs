@@ -5,7 +5,7 @@ use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 2 {
         eprintln!("Usage: {} <ip_address>", args[0]);
         eprintln!("Example: {} 8.8.8.8", args[0]);

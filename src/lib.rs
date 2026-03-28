@@ -229,7 +229,9 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
             libc::SO_RCVTIMEO,
             (&raw const timeval).cast::<libc::c_void>(),
             #[allow(clippy::cast_possible_truncation)]
-            { mem::size_of::<libc::timeval>() as libc::socklen_t },
+            {
+                mem::size_of::<libc::timeval>() as libc::socklen_t
+            },
         ) < 0
         {
             libc::close(sock);
@@ -248,7 +250,9 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
                 libc::IP_MTU_DISCOVER,
                 (&raw const val).cast::<libc::c_void>(),
                 #[allow(clippy::cast_possible_truncation)]
-                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+                {
+                    mem::size_of::<libc::c_int>() as libc::socklen_t
+                },
             ) < 0
             {
                 libc::close(sock);
@@ -264,7 +268,9 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
                 libc::IP_DONTFRAG,
                 (&raw const val).cast::<libc::c_void>(),
                 #[allow(clippy::cast_possible_truncation)]
-                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+                {
+                    mem::size_of::<libc::c_int>() as libc::socklen_t
+                },
             ) < 0
             {
                 libc::close(sock);
@@ -340,7 +346,9 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
             0,
             (&raw const dest_addr).cast::<libc::sockaddr>(),
             #[allow(clippy::cast_possible_truncation)]
-            { mem::size_of::<libc::sockaddr_in>() as libc::socklen_t },
+            {
+                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+            },
         )
     };
 
@@ -466,7 +474,9 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
             libc::SO_RCVTIMEO,
             (&raw const timeval).cast::<libc::c_void>(),
             #[allow(clippy::cast_possible_truncation)]
-            { mem::size_of::<libc::timeval>() as libc::socklen_t },
+            {
+                mem::size_of::<libc::timeval>() as libc::socklen_t
+            },
         ) < 0
         {
             libc::close(sock);
@@ -485,7 +495,9 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
                 libc::IPV6_MTU_DISCOVER,
                 (&raw const val).cast::<libc::c_void>(),
                 #[allow(clippy::cast_possible_truncation)]
-                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+                {
+                    mem::size_of::<libc::c_int>() as libc::socklen_t
+                },
             ) < 0
             {
                 libc::close(sock);
@@ -501,7 +513,9 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
                 libc::IPV6_DONTFRAG,
                 (&raw const val).cast::<libc::c_void>(),
                 #[allow(clippy::cast_possible_truncation)]
-                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+                {
+                    mem::size_of::<libc::c_int>() as libc::socklen_t
+                },
             ) < 0
             {
                 libc::close(sock);
@@ -576,7 +590,9 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
             0,
             (&raw const dest_addr).cast::<libc::sockaddr>(),
             #[allow(clippy::cast_possible_truncation)]
-            { mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t },
+            {
+                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+            },
         )
     };
 
@@ -687,7 +703,9 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 
     // Return one's complement
     #[allow(clippy::cast_possible_truncation)]
-    { !sum as u16 }
+    {
+        !sum as u16
+    }
 }
 
 #[cfg(test)]
@@ -702,7 +720,7 @@ mod tests {
         let checksum = calculate_checksum(&data);
         // Expected: ~(0x0800) = 0xf7ff
         assert_eq!(checksum, 0xf7ff);
-        
+
         // Test with odd length data
         let data = vec![0x00, 0x01, 0x02];
         let checksum = calculate_checksum(&data);
@@ -714,11 +732,11 @@ mod tests {
     fn test_thread_id_uniqueness() {
         use std::sync::{Arc, Mutex};
         use std::thread;
-        
+
         // Collect IDs from multiple threads
         let ids = Arc::new(Mutex::new(Vec::new()));
         let mut handles = vec![];
-        
+
         for _ in 0..5 {
             let ids_clone = Arc::clone(&ids);
             let handle = thread::spawn(move || {
@@ -727,18 +745,18 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         let ids = ids.lock().unwrap();
         // All thread IDs should be unique
         let mut sorted_ids = ids.clone();
         sorted_ids.sort();
         sorted_ids.dedup();
         assert_eq!(ids.len(), sorted_ids.len(), "Thread IDs should be unique");
-        
+
         // Main thread should also have a consistent ID
         let main_id1 = get_thread_id();
         let main_id2 = get_thread_id();
@@ -749,15 +767,18 @@ mod tests {
     fn test_get_monotonic_time() {
         // Test that we can get a monotonic timestamp
         let ts1 = get_monotonic_time().expect("Failed to get monotonic time");
-        
+
         // Verify fields are reasonable (not zero and not maxed out)
         assert!(ts1.sec > 0, "Seconds should be non-zero");
-        assert!(ts1.nsec < 1_000_000_000, "Nanoseconds should be less than 1 billion");
-        
+        assert!(
+            ts1.nsec < 1_000_000_000,
+            "Nanoseconds should be less than 1 billion"
+        );
+
         // Get another timestamp and verify time moves forward
         std::thread::sleep(Duration::from_millis(10));
         let ts2 = get_monotonic_time().expect("Failed to get monotonic time");
-        
+
         // Second timestamp should be greater than first
         let total1 = (ts1.sec as u64) * 1_000_000_000 + (ts1.nsec as u64);
         let total2 = (ts2.sec as u64) * 1_000_000_000 + (ts2.nsec as u64);
@@ -767,11 +788,17 @@ mod tests {
     #[test]
     fn test_calculate_duration() {
         // Test basic duration calculation
-        let start = Timestamp { sec: 10, nsec: 500_000_000 };
-        let end = Timestamp { sec: 12, nsec: 250_000_000 };
-        
+        let start = Timestamp {
+            sec: 10,
+            nsec: 500_000_000,
+        };
+        let end = Timestamp {
+            sec: 12,
+            nsec: 250_000_000,
+        };
+
         let duration = calculate_duration(start, end);
-        
+
         // Should be 1.75 seconds (12.25 - 10.5)
         assert_eq!(duration.as_secs(), 1);
         assert_eq!(duration.subsec_nanos(), 750_000_000);
@@ -780,11 +807,17 @@ mod tests {
     #[test]
     fn test_calculate_duration_same_second() {
         // Test duration within same second
-        let start = Timestamp { sec: 5, nsec: 100_000_000 };
-        let end = Timestamp { sec: 5, nsec: 300_000_000 };
-        
+        let start = Timestamp {
+            sec: 5,
+            nsec: 100_000_000,
+        };
+        let end = Timestamp {
+            sec: 5,
+            nsec: 300_000_000,
+        };
+
         let duration = calculate_duration(start, end);
-        
+
         // Should be 200ms
         assert_eq!(duration.as_millis(), 200);
     }
@@ -792,32 +825,47 @@ mod tests {
     #[test]
     fn test_calculate_duration_zero() {
         // Test zero duration
-        let ts = Timestamp { sec: 10, nsec: 500_000_000 };
-        
+        let ts = Timestamp {
+            sec: 10,
+            nsec: 500_000_000,
+        };
+
         let duration = calculate_duration(ts, ts);
-        
+
         assert_eq!(duration.as_nanos(), 0);
     }
 
     #[test]
     fn test_calculate_duration_backwards() {
         // Test that backwards time gives zero (shouldn't happen with monotonic clock)
-        let start = Timestamp { sec: 12, nsec: 500_000_000 };
-        let end = Timestamp { sec: 10, nsec: 250_000_000 };
-        
+        let start = Timestamp {
+            sec: 12,
+            nsec: 500_000_000,
+        };
+        let end = Timestamp {
+            sec: 10,
+            nsec: 250_000_000,
+        };
+
         let duration = calculate_duration(start, end);
-        
+
         assert_eq!(duration.as_nanos(), 0);
     }
 
     #[test]
     fn test_calculate_duration_microsecond_precision() {
         // Test microsecond-level precision
-        let start = Timestamp { sec: 0, nsec: 1_000 };
-        let end = Timestamp { sec: 0, nsec: 2_000 };
-        
+        let start = Timestamp {
+            sec: 0,
+            nsec: 1_000,
+        };
+        let end = Timestamp {
+            sec: 0,
+            nsec: 2_000,
+        };
+
         let duration = calculate_duration(start, end);
-        
+
         assert_eq!(duration.as_nanos(), 1_000);
     }
 
