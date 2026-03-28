@@ -1,9 +1,10 @@
-use icmp_echo::ping;
+use icmp_echo::ping_async;
 use std::env;
 use std::net::IpAddr;
 use std::time::Duration;
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -24,11 +25,11 @@ fn main() {
     let payload_size = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(56);
 
     println!(
-        "Pinging {} with {} bytes of data ({} times)...",
+        "Pinging {} with {} bytes of data ({} times) [async]...",
         dest, payload_size, count
     );
 
-    match ping(dest, payload_size, count, Duration::from_secs(5)) {
+    match ping_async(dest, payload_size, count, Duration::from_secs(5)).await {
         Ok((avg_rtt, packet_loss)) => {
             println!("✓ Ping successful!");
             println!("  Average round-trip time: {:.3} ms", avg_rtt);
@@ -37,7 +38,7 @@ fn main() {
         Err(e) => {
             eprintln!("✗ Ping failed: {}", e);
             eprintln!("\nNote: This program requires raw socket permissions.");
-            eprintln!("      Run with: sudo target/debug/examples/simple_ping <ip>");
+            eprintln!("      Run with: sudo target/debug/examples/async_ping <ip>");
             std::process::exit(1);
         }
     }

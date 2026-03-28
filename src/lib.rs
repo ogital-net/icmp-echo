@@ -158,6 +158,13 @@ impl Drop for Socket {
     }
 }
 
+#[cfg(unix)]
+impl std::os::unix::io::AsRawFd for Socket {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0
+    }
+}
+
 enum Domain {
     Ipv4,
     Ipv6,
@@ -435,6 +442,7 @@ pub fn generate_payload(size: usize) -> Vec<u8> {
 /// * `dest` - Destination IP address (IPv4 or IPv6)
 /// * `payload_size` - Total payload size in bytes, including 8 bytes for timestamp (minimum 8)
 /// * `count` - Number of echo requests to send
+/// * `timeout` - Maximum time to wait for each individual reply
 ///
 /// # Returns
 /// * `Ok((f64, f64))` - Tuple of (average RTT in milliseconds, packet loss percentage)
@@ -459,10 +467,15 @@ pub fn generate_payload(size: usize) -> Vec<u8> {
 ///
 /// // Ping localhost 4 times with 56 byte payload
 /// let dest = "127.0.0.1".parse::<IpAddr>().unwrap();
-/// let (avg_rtt, packet_loss) = ping(dest, 56, 4).expect("Ping failed");
+/// let (avg_rtt, packet_loss) = ping(dest, 56, 4, std::time::Duration::from_secs(5)).expect("Ping failed");
 /// println!("Average RTT: {:.2} ms, Packet Loss: {:.1}%", avg_rtt, packet_loss);
 /// ```
-pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64, f64)> {
+pub fn ping(
+    dest: IpAddr,
+    payload_size: usize,
+    count: usize,
+    timeout: Duration,
+) -> io::Result<(f64, f64)> {
     // Validate payload size
     if payload_size < 8 {
         return Err(io::Error::new(
@@ -474,7 +487,6 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64,
     let payload = generate_payload(payload_size - 8);
 
     // Send echo requests and collect successful RTTs
-    let timeout = Duration::from_secs(5);
     let mut rtts = Vec::new();
     let mut failed_count = 0;
 
@@ -625,31 +637,7 @@ fn sendto(sock: &Socket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
 fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     let sock = create_socket(Domain::Ipv4, timeout)?;
 
-    // Build ICMP packet with timestamp
-    let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
-    let our_id = get_echo_id();
-
-    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let header = IcmpHeader {
-        typ: ICMP_ECHO_REQUEST,
-        code: 0,
-        checksum: 0,
-        id: our_id.to_be(),
-        sequence: seq.to_be(),
-    };
-
-    // Add header to packet
-    packet.extend_from_slice(header.as_bytes());
-
-    // Encode current monotonic time as timestamp (before user payload)
-    let timestamp = Timestamp::now();
-
-    packet.extend_from_slice(timestamp.as_bytes());
-
-    // Add user payload after timestamp
-    packet.extend_from_slice(payload);
-
-    // Calculate checksum
+    let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
     let checksum = calculate_checksum(&packet);
     packet[2] = (checksum >> 8) as u8;
     packet[3] = (checksum & 0xff) as u8;
@@ -737,32 +725,8 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     let sock = create_socket(Domain::Ipv6, timeout)?;
 
-    // Build ICMPv6 packet with timestamp
-    let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
-    let our_id = get_echo_id();
-
-    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let header = IcmpHeader {
-        typ: ICMP6_ECHO_REQUEST,
-        code: 0,
-        checksum: 0, // Kernel calculates checksum for ICMPv6
-        id: our_id.to_be(),
-        sequence: seq.to_be(),
-    };
-
-    // Add header to packet
-    packet.extend_from_slice(header.as_bytes());
-
-    // Encode current monotonic time as timestamp (before user payload)
-    let timestamp = Timestamp::now();
-
-    packet.extend_from_slice(timestamp.as_bytes());
-
-    // Add user payload after timestamp
-    packet.extend_from_slice(payload);
-
-    // Note: For IPv6, the kernel automatically calculates the ICMPv6 checksum
-    // so we don't need to calculate it ourselves
+    // Note: For IPv6 the kernel automatically computes the ICMPv6 checksum.
+    let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
     // Send packet
     sendto(&sock, &packet, IpAddr::V6(dest))?;
@@ -862,6 +826,274 @@ fn calculate_checksum(data: &[u8]) -> u16 {
         !sum as u16
     }
 }
+
+/// Build an ICMP/ICMPv6 echo-request packet.
+///
+/// Returns `(echo_id, packet)`. The caller is responsible for computing and
+/// writing the ICMPv4 checksum when needed (ICMPv6 checksums are handled by
+/// the kernel).
+fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, Vec<u8>) {
+    let our_id = get_echo_id();
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let header = IcmpHeader {
+        typ,
+        code: 0,
+        checksum: 0,
+        id: our_id.to_be(),
+        sequence: seq.to_be(),
+    };
+    let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
+    packet.extend_from_slice(header.as_bytes());
+    packet.extend_from_slice(Timestamp::now().as_bytes());
+    packet.extend_from_slice(payload);
+    (our_id, packet)
+}
+
+/// Async implementation backed by tokio.
+#[cfg(feature = "tokio")]
+mod async_impl {
+    use super::{
+        build_icmp_packet, calculate_checksum, create_socket, sendto, Domain, Socket, Timestamp,
+        ICMP6_ECHO_REPLY, ICMP6_ECHO_REQUEST, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
+    };
+    use crate::generate_payload;
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
+    use tokio::io::unix::AsyncFd;
+    use tokio::time::timeout;
+
+    /// Wrap an existing [`Socket`] in [`AsyncFd`] after switching it to non-blocking mode.
+    fn into_async(sock: Socket) -> io::Result<AsyncFd<Socket>> {
+        unsafe {
+            let flags = libc::fcntl(sock.as_fd(), libc::F_GETFL);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(sock.as_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        AsyncFd::new(sock)
+    }
+
+    /// Send a packet and receive the echo reply asynchronously, IPv4.
+    async fn send_icmp_echo_v4_async(
+        dest: Ipv4Addr,
+        payload: &[u8],
+        tout: Duration,
+    ) -> io::Result<Duration> {
+        let afd = into_async(create_socket(Domain::Ipv4, tout)?)?;
+
+        let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
+        let checksum = calculate_checksum(&packet);
+        packet[2] = (checksum >> 8) as u8;
+        packet[3] = (checksum & 0xff) as u8;
+
+        // Send
+        loop {
+            let mut guard = afd.writable().await?;
+            match sendto(guard.get_inner(), &packet, IpAddr::V4(dest)) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Receive with timeout
+        let mut recv_buf = [0u8; 1024];
+        let overall = timeout(tout, async {
+            loop {
+                let mut guard = afd.readable().await?;
+                let received = unsafe {
+                    libc::recv(
+                        guard.get_inner().as_fd(),
+                        recv_buf.as_mut_ptr().cast::<libc::c_void>(),
+                        recv_buf.len(),
+                        0,
+                    )
+                };
+                if received < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    return Err(e);
+                }
+                #[allow(clippy::cast_sign_loss)]
+                let received = received as usize;
+                if received < 28 {
+                    guard.clear_ready();
+                    continue;
+                }
+                let ip_hlen = ((recv_buf[0] & 0x0f) * 4) as usize;
+                if received < ip_hlen + 8 {
+                    guard.clear_ready();
+                    continue;
+                }
+                let reply_type = recv_buf[ip_hlen];
+                let reply_id = u16::from_be_bytes([recv_buf[ip_hlen + 4], recv_buf[ip_hlen + 5]]);
+                if reply_type != ICMP_ECHO_REPLY || reply_id != our_id {
+                    guard.clear_ready();
+                    continue;
+                }
+                let recv_time = Timestamp::now();
+                let ts_offset = ip_hlen + 8;
+                let ts_size = Timestamp::len();
+                if received >= ts_offset + ts_size {
+                    let ts = Timestamp::try_from(&recv_buf[ts_offset..ts_offset + ts_size])?;
+                    return Ok(recv_time - ts);
+                }
+                return Ok(Duration::from_secs(0));
+            }
+        });
+
+        match overall.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+        }
+    }
+
+    /// Send a packet and receive the echo reply asynchronously, IPv6.
+    async fn send_icmp_echo_v6_async(
+        dest: Ipv6Addr,
+        payload: &[u8],
+        tout: Duration,
+    ) -> io::Result<Duration> {
+        let afd = into_async(create_socket(Domain::Ipv6, tout)?)?;
+
+        let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
+
+        loop {
+            let mut guard = afd.writable().await?;
+            match sendto(guard.get_inner(), &packet, IpAddr::V6(dest)) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut recv_buf = [0u8; 1024];
+        let overall = timeout(tout, async {
+            loop {
+                let mut guard = afd.readable().await?;
+                let received = unsafe {
+                    libc::recv(
+                        guard.get_inner().as_fd(),
+                        recv_buf.as_mut_ptr().cast::<libc::c_void>(),
+                        recv_buf.len(),
+                        0,
+                    )
+                };
+                if received < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    return Err(e);
+                }
+                #[allow(clippy::cast_sign_loss)]
+                let received = received as usize;
+                if received < 8 {
+                    guard.clear_ready();
+                    continue;
+                }
+                let reply_type = recv_buf[0];
+                let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
+                if reply_type != ICMP6_ECHO_REPLY || reply_id != our_id {
+                    guard.clear_ready();
+                    continue;
+                }
+                let recv_time = Timestamp::now();
+                let ts_size = Timestamp::len();
+                if received >= 8 + ts_size {
+                    let ts = Timestamp::try_from(&recv_buf[8..8 + ts_size])?;
+                    return Ok(recv_time - ts);
+                }
+                return Ok(Duration::from_secs(0));
+            }
+        });
+
+        match overall.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+        }
+    }
+
+    /// Async version of [`send_icmp_echo`](super::send_icmp_echo).
+    ///
+    /// Sends an ICMP echo request and returns the round-trip time.
+    /// Requires a tokio runtime. Requires raw socket permissions.
+    pub async fn send_icmp_echo_async(
+        dest: IpAddr,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> io::Result<Duration> {
+        match dest {
+            IpAddr::V4(addr) => send_icmp_echo_v4_async(addr, payload, timeout).await,
+            IpAddr::V6(addr) => send_icmp_echo_v6_async(addr, payload, timeout).await,
+        }
+    }
+
+    /// Async version of [`ping`](super::ping).
+    ///
+    /// Sends `count` ICMP echo requests and returns `(avg_rtt_ms, packet_loss_pct)`.
+    /// Requires a tokio runtime. Requires raw socket permissions.
+    ///
+    /// # Errors
+    /// Returns an error if all requests fail or the payload size is less than 8 bytes.
+    pub async fn ping_async(
+        dest: IpAddr,
+        payload_size: usize,
+        count: usize,
+        timeout: Duration,
+    ) -> io::Result<(f64, f64)> {
+        if payload_size < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Payload size must be at least 8 bytes (for timestamp)",
+            ));
+        }
+
+        let payload = generate_payload(payload_size - 8);
+        let mut rtts = Vec::new();
+        let mut failed_count = 0usize;
+
+        for i in 0..count {
+            match send_icmp_echo_async(dest, &payload, timeout).await {
+                Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0),
+                Err(_) => failed_count += 1,
+            }
+            if i < count - 1 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        if rtts.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "All requests failed (100% packet loss)",
+            ));
+        }
+
+        let sum: f64 = rtts.iter().sum();
+        #[allow(clippy::cast_precision_loss)]
+        let avg = sum / rtts.len() as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let packet_loss = (failed_count as f64 / count as f64) * 100.0;
+
+        Ok((avg, packet_loss))
+    }
+}
+
+#[cfg(feature = "tokio")]
+pub use async_impl::{ping_async, send_icmp_echo_async};
 
 #[cfg(test)]
 mod tests {
@@ -1088,7 +1320,7 @@ mod tests {
     fn test_ping_invalid_payload_size() {
         // Test with payload size less than 8 bytes
         let dest = "127.0.0.1".parse().unwrap();
-        let result = ping(dest, 7, 4);
+        let result = ping(dest, 7, 4, Duration::from_secs(5));
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
@@ -1103,7 +1335,7 @@ mod tests {
 
         // Test the ping helper function with localhost
         let dest = "127.0.0.1".parse().unwrap();
-        match ping(dest, 56, 3) {
+        match ping(dest, 56, 3, Duration::from_secs(5)) {
             Ok((avg_rtt, packet_loss)) => {
                 println!(
                     "Average RTT: {:.3} ms, Packet Loss: {:.1}%",
@@ -1252,6 +1484,66 @@ mod tests {
                 }
                 Err(e) => panic!("Thread {} ping failed: {}", i, e),
             }
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    mod async_tests {
+        use super::*;
+        use crate::{ping_async, send_icmp_echo_async};
+
+        #[tokio::test]
+        async fn test_send_icmp_echo_async_v4() {
+            if !has_raw_socket_permission() {
+                println!("Skipping test_send_icmp_echo_async_v4: requires root privileges");
+                return;
+            }
+            let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+            let rtt = send_icmp_echo_async(dest, b"async test", Duration::from_secs(5))
+                .await
+                .expect("async ICMPv4 ping failed");
+            println!("async IPv4 RTT: {:?}", rtt);
+            assert!(rtt < Duration::from_secs(5));
+        }
+
+        #[tokio::test]
+        async fn test_send_icmp_echo_async_v6() {
+            if !has_raw_socket_permission() {
+                println!("Skipping test_send_icmp_echo_async_v6: requires root privileges");
+                return;
+            }
+            let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+            let rtt = send_icmp_echo_async(dest, b"async test", Duration::from_secs(5))
+                .await
+                .expect("async ICMPv6 ping failed");
+            println!("async IPv6 RTT: {:?}", rtt);
+            assert!(rtt < Duration::from_secs(5));
+        }
+
+        #[tokio::test]
+        async fn test_ping_async_localhost() {
+            if !has_raw_socket_permission() {
+                println!("Skipping test_ping_async_localhost: requires root privileges");
+                return;
+            }
+            let dest = "127.0.0.1".parse().unwrap();
+            let (avg_rtt, packet_loss) = ping_async(dest, 56, 3, Duration::from_secs(5))
+                .await
+                .expect("ping_async failed");
+            println!(
+                "async avg RTT: {:.3} ms, loss: {:.1}%",
+                avg_rtt, packet_loss
+            );
+            assert!(avg_rtt > 0.0 && avg_rtt < 1000.0);
+            assert!((0.0..=100.0).contains(&packet_loss));
+        }
+
+        #[tokio::test]
+        async fn test_ping_async_invalid_payload() {
+            let dest = "127.0.0.1".parse().unwrap();
+            let result = ping_async(dest, 7, 1, Duration::from_secs(5)).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         }
     }
 }

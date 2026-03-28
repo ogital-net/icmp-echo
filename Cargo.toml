@@ -6,6 +6,12 @@ edition = "2021"
 [features]
 default = ["std"]
 std = []
+tokio = ["dep:tokio", "std"]
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
+tokio = { version = "1", features = ["net", "time", "rt", "macros"], optional = true }
+
+[[example]]
+name = "async_ping"
+required-features = ["tokio"]
