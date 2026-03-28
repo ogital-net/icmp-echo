@@ -167,9 +167,14 @@ fn create_socket(domain: Domain, timeout: Duration) -> io::Result<Socket> {
             // Set Do Not Fragment bit for IPv6
             unsafe {
                 #[cfg(target_os = "linux")]
-                let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO);
+                let (level, optname, val) = (
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_MTU_DISCOVER,
+                    libc::IPV6_PMTUDISC_DO,
+                );
                 #[cfg(not(target_os = "linux"))]
-                let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1 as libc::c_int);
+                let (level, optname, val) =
+                    (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1 as libc::c_int);
 
                 if libc::setsockopt(
                     sock.as_fd(),
@@ -223,7 +228,12 @@ impl Timestamp {
             libc::clock_gettime(clock_id, ts.as_mut_ptr())
         };
 
-        assert_eq!(result, 0, "clock_gettime failed: {}", io::Error::last_os_error());
+        assert_eq!(
+            result,
+            0,
+            "clock_gettime failed: {}",
+            io::Error::last_os_error()
+        );
 
         let ts = unsafe { ts.assume_init() };
 
@@ -974,6 +984,46 @@ mod tests {
             Err(e) => {
                 panic!("Ping failed: {}", e);
             }
+        }
+    }
+
+    #[test]
+    fn test_ping_localhost_v4_large_payload() {
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_localhost_v4_large_payload: requires root privileges");
+            return;
+        }
+
+        let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
+        let timeout = Duration::from_secs(5);
+
+        match send_icmp_echo(dest, &payload, timeout) {
+            Ok(rtt) => {
+                println!("IPv4 2K payload RTT: {:?}", rtt);
+                assert!(rtt < timeout);
+            }
+            Err(e) => panic!("IPv4 2K ping failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_ping_localhost_v6_large_payload() {
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_localhost_v6_large_payload: requires root privileges");
+            return;
+        }
+
+        let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+        let payload = vec![0u8; 2048 - 8]; // 2K total, minus 8 bytes for timestamp
+        let timeout = Duration::from_secs(5);
+
+        match send_icmp_echo(dest, &payload, timeout) {
+            Ok(rtt) => {
+                println!("IPv6 2K payload RTT: {:?}", rtt);
+                assert!(rtt < timeout);
+            }
+            Err(e) => panic!("IPv6 2K ping failed: {}", e),
         }
     }
 }
