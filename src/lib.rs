@@ -183,10 +183,15 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64,
     let mut rtts = Vec::new();
     let mut failed_count = 0;
 
-    for _ in 0..count {
+    for i in 0..count {
         match send_icmp_echo(dest, &payload, timeout) {
             Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0), // Convert to milliseconds
             Err(_) => failed_count += 1,
+        }
+
+        // Sleep between sends (except after the last one)
+        if i < count - 1 {
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
