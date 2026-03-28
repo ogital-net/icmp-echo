@@ -12,6 +12,7 @@ use std::cell::Cell;
 #[cfg(feature = "std")]
 use std::io;
 
+use core::marker::PhantomData;
 use core::mem;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -144,33 +145,82 @@ const ICMP6_ECHO_REPLY: u8 = 129;
 const IPPROTO_ICMP: libc::c_int = 1;
 const IPPROTO_ICMPV6: libc::c_int = 58;
 
-struct Socket(i32);
+/// A raw ICMP socket.
+///
+/// This type is intentionally `!Sync`: ICMP is connectionless and the kernel
+/// delivers a copy of every incoming ICMP packet to **all** raw-socket
+/// listeners. If a single `IcmpSocket` were shared across threads, one thread
+/// could accidentally consume the reply that was meant for another, producing
+/// a spurious timeout. Keeping the socket `!Sync` prevents this class of bug
+/// at compile time while still allowing the socket to be **moved** between
+/// threads (`Send`).
+pub struct IcmpSocket(
+    i32,
+    // PhantomData<Cell<()>> opts out of Sync (Cell is !Sync) while keeping
+    // Send (Cell<T>: Send when T: Send, and () is Send).
+    PhantomData<core::cell::Cell<()>>,
+);
 
-impl Socket {
-    fn as_fd(&self) -> i32 {
+impl IcmpSocket {
+    /// Create a new IPv4 ICMP raw socket with the given receive timeout.
+    pub fn new_v4(timeout: Duration) -> io::Result<Self> {
+        create_socket(Domain::Ipv4, timeout)
+    }
+
+    /// Create a new IPv6 ICMPv6 raw socket with the given receive timeout.
+    pub fn new_v6(timeout: Duration) -> io::Result<Self> {
+        create_socket(Domain::Ipv6, timeout)
+    }
+
+    /// Return the underlying file descriptor.
+    pub fn as_fd(&self) -> i32 {
         self.0
     }
 }
 
-impl Drop for Socket {
+impl Drop for IcmpSocket {
     fn drop(&mut self) {
         unsafe { libc::close(self.0) };
     }
 }
 
 #[cfg(unix)]
-impl std::os::unix::io::AsRawFd for Socket {
+impl std::os::unix::io::AsRawFd for IcmpSocket {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.0
     }
 }
 
+#[cfg(feature = "tokio")]
+impl IcmpSocket {
+    /// Switch the socket to non-blocking mode and wrap it in a
+    /// [`tokio::io::unix::AsyncFd`] for use with [`send_icmp_echo_v4_async`]
+    /// and [`send_icmp_echo_v6_async`].
+    ///
+    /// The returned `AsyncFd` can be passed by shared reference (`&afd`) to
+    /// successive calls, so a single socket can be reused across multiple
+    /// probes without paying the cost of opening a new socket each time.
+    pub fn into_async(self) -> std::io::Result<tokio::io::unix::AsyncFd<Self>> {
+        unsafe {
+            let flags = libc::fcntl(self.0, libc::F_GETFL);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(self.0, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        tokio::io::unix::AsyncFd::new(self)
+    }
+}
+
+#[derive(Copy, Clone)]
 enum Domain {
     Ipv4,
     Ipv6,
 }
 
-fn create_socket(domain: Domain, timeout: Duration) -> io::Result<Socket> {
+fn create_socket(domain: Domain, timeout: Duration) -> io::Result<IcmpSocket> {
     let (af, protocol) = match domain {
         Domain::Ipv4 => (libc::AF_INET, IPPROTO_ICMP),
         Domain::Ipv6 => (libc::AF_INET6, IPPROTO_ICMPV6),
@@ -181,7 +231,7 @@ fn create_socket(domain: Domain, timeout: Duration) -> io::Result<Socket> {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Socket(fd)
+        IcmpSocket(fd, PhantomData)
     };
 
     // Set receive timeout
@@ -551,12 +601,18 @@ pub fn ping(
 /// For `IPv4` destinations, sends ICMP echo requests.
 pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     match dest {
-        IpAddr::V4(addr) => send_icmp_echo_v4(addr, payload, timeout),
-        IpAddr::V6(addr) => send_icmp_echo_v6(addr, payload, timeout),
+        IpAddr::V4(addr) => {
+            let sock = IcmpSocket::new_v4(timeout)?;
+            send_icmp_echo_v4(&sock, addr, payload)
+        }
+        IpAddr::V6(addr) => {
+            let sock = IcmpSocket::new_v6(timeout)?;
+            send_icmp_echo_v6(&sock, addr, payload)
+        }
     }
 }
 
-fn sendto(sock: &Socket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
+fn sendto(sock: &IcmpSocket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
     let sent = match dest {
         IpAddr::V4(addr) => {
             #[allow(clippy::cast_possible_truncation)]
@@ -633,10 +689,12 @@ fn sendto(sock: &Socket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
 }
 
 /// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
+///
+/// # Note
+/// `sock` must be an IPv4 ICMP socket (i.e. created with [`IcmpSocket::new_v4`]).
+/// Passing an IPv6 socket results in undefined behaviour at the `sendto`/`recvfrom` level.
 #[allow(clippy::too_many_lines)]
-fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    let sock = create_socket(Domain::Ipv4, timeout)?;
-
+pub fn send_icmp_echo_v4(sock: &IcmpSocket, dest: Ipv4Addr, payload: &[u8]) -> io::Result<Duration> {
     let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
     let checksum = calculate_checksum(&packet);
     packet[2] = (checksum >> 8) as u8;
@@ -721,10 +779,12 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 }
 
 /// Send an `ICMPv6` echo request with the given payload and return the round-trip time.
+///
+/// # Note
+/// `sock` must be an IPv6 ICMPv6 socket (i.e. created with [`IcmpSocket::new_v6`]).
+/// Passing an IPv4 socket results in undefined behaviour at the `sendto`/`recvfrom` level.
 #[allow(clippy::too_many_lines)]
-fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    let sock = create_socket(Domain::Ipv6, timeout)?;
-
+pub fn send_icmp_echo_v6(sock: &IcmpSocket, dest: Ipv6Addr, payload: &[u8]) -> io::Result<Duration> {
     // Note: For IPv6 the kernel automatically computes the ICMPv6 checksum.
     let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
@@ -853,7 +913,7 @@ fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, Vec<u8>) {
 #[cfg(feature = "tokio")]
 mod async_impl {
     use super::{
-        build_icmp_packet, calculate_checksum, create_socket, sendto, Domain, Socket, Timestamp,
+        build_icmp_packet, calculate_checksum, sendto, IcmpSocket, Timestamp,
         ICMP6_ECHO_REPLY, ICMP6_ECHO_REQUEST, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
     };
     use crate::generate_payload;
@@ -863,28 +923,20 @@ mod async_impl {
     use tokio::io::unix::AsyncFd;
     use tokio::time::timeout;
 
-    /// Wrap an existing [`Socket`] in [`AsyncFd`] after switching it to non-blocking mode.
-    fn into_async(sock: Socket) -> io::Result<AsyncFd<Socket>> {
-        unsafe {
-            let flags = libc::fcntl(sock.as_fd(), libc::F_GETFL);
-            if flags < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(sock.as_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        AsyncFd::new(sock)
-    }
-
-    /// Send a packet and receive the echo reply asynchronously, IPv4.
-    async fn send_icmp_echo_v4_async(
+    /// Send an ICMPv4 echo request on an existing non-blocking socket and return the RTT.
+    ///
+    /// Accepts a shared reference so the same socket can be reused across multiple
+    /// probes (e.g. inside a ping loop) without reopening the file descriptor.
+    ///
+    /// # Note
+    /// `afd` must wrap an IPv4 ICMP socket (created with [`IcmpSocket::new_v4`] then
+    /// [`IcmpSocket::into_async`]). Passing an IPv6 socket results in undefined behaviour.
+    pub async fn send_icmp_echo_v4_async(
+        afd: &AsyncFd<IcmpSocket>,
         dest: Ipv4Addr,
         payload: &[u8],
         tout: Duration,
     ) -> io::Result<Duration> {
-        let afd = into_async(create_socket(Domain::Ipv4, tout)?)?;
-
         let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
         let checksum = calculate_checksum(&packet);
         packet[2] = (checksum >> 8) as u8;
@@ -957,14 +1009,20 @@ mod async_impl {
         }
     }
 
-    /// Send a packet and receive the echo reply asynchronously, IPv6.
-    async fn send_icmp_echo_v6_async(
+    /// Send an ICMPv6 echo request on an existing non-blocking socket and return the RTT.
+    ///
+    /// Accepts a shared reference so the same socket can be reused across multiple
+    /// probes (e.g. inside a ping loop) without reopening the file descriptor.
+    ///
+    /// # Note
+    /// `afd` must wrap an IPv6 ICMPv6 socket (created with [`IcmpSocket::new_v6`] then
+    /// [`IcmpSocket::into_async`]). Passing an IPv4 socket results in undefined behaviour.
+    pub async fn send_icmp_echo_v6_async(
+        afd: &AsyncFd<IcmpSocket>,
         dest: Ipv6Addr,
         payload: &[u8],
         tout: Duration,
     ) -> io::Result<Duration> {
-        let afd = into_async(create_socket(Domain::Ipv6, tout)?)?;
-
         let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
         loop {
@@ -1036,8 +1094,14 @@ mod async_impl {
         timeout: Duration,
     ) -> io::Result<Duration> {
         match dest {
-            IpAddr::V4(addr) => send_icmp_echo_v4_async(addr, payload, timeout).await,
-            IpAddr::V6(addr) => send_icmp_echo_v6_async(addr, payload, timeout).await,
+            IpAddr::V4(addr) => {
+                let afd = IcmpSocket::new_v4(timeout)?.into_async()?;
+                send_icmp_echo_v4_async(&afd, addr, payload, timeout).await
+            }
+            IpAddr::V6(addr) => {
+                let afd = IcmpSocket::new_v6(timeout)?.into_async()?;
+                send_icmp_echo_v6_async(&afd, addr, payload, timeout).await
+            }
         }
     }
 
@@ -1093,7 +1157,7 @@ mod async_impl {
 }
 
 #[cfg(feature = "tokio")]
-pub use async_impl::{ping_async, send_icmp_echo_async};
+pub use async_impl::{ping_async, send_icmp_echo_async, send_icmp_echo_v4_async, send_icmp_echo_v6_async};
 
 #[cfg(test)]
 mod tests {
