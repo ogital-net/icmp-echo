@@ -124,10 +124,10 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
     }
 }
 
-/// Send multiple ICMP echo requests and return the average round-trip time.
+/// Send multiple ICMP echo requests and return the average round-trip time and packet loss.
 ///
 /// This is a convenience function that sends multiple ICMP echo requests to the specified
-/// destination and calculates the average RTT of successful responses.
+/// destination and calculates statistics including average RTT and packet loss percentage.
 ///
 /// # Arguments
 /// * `dest` - Destination IP address (IPv4 or IPv6)
@@ -135,19 +135,20 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
 /// * `count` - Number of echo requests to send
 ///
 /// # Returns
-/// * `Ok(f64)` - Average round-trip time in milliseconds
-/// * `Err(io::Error)` - If no responses received or socket operations fail
+/// * `Ok((f64, f64))` - Tuple of (average RTT in milliseconds, packet loss percentage)
+/// * `Err(io::Error)` - If all requests fail or socket operations fail
 ///
 /// # Errors
 /// Returns an error if:
-/// - No successful echo replies are received
+/// - All echo requests fail or time out (100% packet loss)
 /// - Socket operations fail (requires raw socket permissions)
 /// - Payload size is less than 8 bytes
 ///
 /// # Notes
 /// This function requires raw socket permissions (typically root/admin).
 /// The payload is filled with a sequential byte pattern similar to standard ping implementations.
-/// Failed requests (timeouts) are skipped and not counted in the average.
+/// Partial failures are handled gracefully - only successful responses are averaged.
+/// Packet loss is calculated as: (failed_count / total_count) * 100.0
 ///
 /// # Examples
 /// ```no_run
@@ -156,10 +157,10 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
 ///
 /// // Ping localhost 4 times with 56 byte payload
 /// let dest = "127.0.0.1".parse::<IpAddr>().unwrap();
-/// let avg_rtt = ping(dest, 56, 4).expect("Ping failed");
-/// println!("Average RTT: {:.2} ms", avg_rtt);
+/// let (avg_rtt, packet_loss) = ping(dest, 56, 4).expect("Ping failed");
+/// println!("Average RTT: {:.2} ms, Packet Loss: {:.1}%", avg_rtt, packet_loss);
 /// ```
-pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<f64> {
+pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64, f64)> {
     // Validate payload size
     if payload_size < 8 {
         return Err(io::Error::new(
@@ -179,28 +180,34 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<f64> 
 
     // Send echo requests and collect successful RTTs
     let timeout = Duration::from_secs(5);
-    let mut successful_rtts = Vec::new();
+    let mut rtts = Vec::new();
+    let mut failed_count = 0;
 
     for _ in 0..count {
-        if let Ok(rtt) = send_icmp_echo(dest, &payload, timeout) {
-            successful_rtts.push(rtt.as_secs_f64() * 1000.0); // Convert to milliseconds
+        match send_icmp_echo(dest, &payload, timeout) {
+            Ok(rtt) => rtts.push(rtt.as_secs_f64() * 1000.0), // Convert to milliseconds
+            Err(_) => failed_count += 1,
         }
     }
 
-    // Check if we got any responses
-    if successful_rtts.is_empty() {
+    // Check if all requests failed
+    if rtts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "No responses received",
+            "All requests failed (100% packet loss)",
         ));
     }
 
-    // Calculate average
-    let sum: f64 = successful_rtts.iter().sum();
+    // Calculate average RTT
+    let sum: f64 = rtts.iter().sum();
     #[allow(clippy::cast_precision_loss)]
-    let avg = sum / successful_rtts.len() as f64;
+    let avg = sum / rtts.len() as f64;
 
-    Ok(avg)
+    // Calculate packet loss percentage
+    #[allow(clippy::cast_precision_loss)]
+    let packet_loss = (failed_count as f64 / count as f64) * 100.0;
+
+    Ok((avg, packet_loss))
 }
 
 /// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
@@ -922,10 +929,11 @@ mod tests {
         // Test the ping helper function with localhost
         let dest = "127.0.0.1".parse().unwrap();
         match ping(dest, 56, 3) {
-            Ok(avg_rtt) => {
-                println!("Average RTT: {:.3} ms", avg_rtt);
+            Ok((avg_rtt, packet_loss)) => {
+                println!("Average RTT: {:.3} ms, Packet Loss: {:.1}%", avg_rtt, packet_loss);
                 assert!(avg_rtt > 0.0);
                 assert!(avg_rtt < 1000.0); // Should be less than 1 second
+                assert!(packet_loss >= 0.0 && packet_loss <= 100.0);
             }
             Err(e) => {
                 eprintln!("Ping failed: {}", e);

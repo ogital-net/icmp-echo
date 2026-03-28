@@ -33,8 +33,9 @@ use std::net::IpAddr;
 fn main() {
     let dest = "8.8.8.8".parse::<IpAddr>().unwrap();
     match ping(dest, 56, 4) {
-        Ok(avg_rtt) => {
+        Ok((avg_rtt, packet_loss)) => {
             println!("Average RTT: {:.3} ms", avg_rtt);
+            println!("Packet Loss: {:.1}%", packet_loss);
         }
         Err(e) => {
             eprintln!("Ping failed: {}", e);
@@ -99,10 +100,10 @@ pub fn ping(
     dest: IpAddr,
     payload_size: usize,
     count: usize
-) -> io::Result<f64>
+) -> io::Result<(f64, f64)>
 ```
 
-High-level convenience function that sends multiple ICMP echo requests and returns the average RTT.
+High-level convenience function that sends multiple ICMP echo requests and returns statistics.
 
 **Parameters:**
 - `dest`: Destination IP address (IPv4 or IPv6)
@@ -110,8 +111,8 @@ High-level convenience function that sends multiple ICMP echo requests and retur
 - `count`: Number of echo requests to send
 
 **Returns:**
-- `Ok(f64)`: Average round-trip time in milliseconds
-- `Err(io::Error)`: If no responses received or socket operations fail
+- `Ok((f64, f64))`: Tuple of (average RTT in milliseconds, packet loss percentage)
+- `Err(io::Error)`: If all requests fail or socket operations fail
 
 ### `send_icmp_echo`
 

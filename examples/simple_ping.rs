@@ -28,9 +28,10 @@ fn main() {
     );
 
     match ping(dest, payload_size, count) {
-        Ok(avg_rtt) => {
+        Ok((avg_rtt, packet_loss)) => {
             println!("✓ Ping successful!");
             println!("  Average round-trip time: {:.3} ms", avg_rtt);
+            println!("  Packet loss: {:.1}%", packet_loss);
         }
         Err(e) => {
             eprintln!("✗ Ping failed: {}", e);
