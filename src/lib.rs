@@ -9,7 +9,7 @@ static SEQUENCE: AtomicU16 = AtomicU16::new(0);
 static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 thread_local! {
-    static THREAD_ID: Cell<u16> = Cell::new(0);
+    static THREAD_ID: Cell<u16> = const { Cell::new(0) };
 }
 
 /// Get a machine-unique identifier for this thread.
@@ -20,6 +20,7 @@ fn get_thread_id() -> u16 {
         let current = id.get();
         if current == 0 {
             let thread_num = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
             let process_id = std::process::id() as u16;
             // XOR thread number with process ID for machine-wide uniqueness
             let unique_id = thread_num ^ process_id;
@@ -56,7 +57,7 @@ struct Timestamp {
 }
 
 /// Get monotonic timestamp for accurate RTT measurement.
-/// Uses CLOCK_MONOTONIC which is not affected by system clock adjustments.
+/// Uses `CLOCK_MONOTONIC` which is not affected by system clock adjustments.
 fn get_monotonic_time() -> io::Result<Timestamp> {
     let mut ts: libc::timespec = unsafe { mem::zeroed() };
 
@@ -66,13 +67,14 @@ fn get_monotonic_time() -> io::Result<Timestamp> {
         #[cfg(not(target_vendor = "apple"))]
         let clock_id = libc::CLOCK_MONOTONIC;
 
-        libc::clock_gettime(clock_id, &mut ts)
+        libc::clock_gettime(clock_id, &raw mut ts)
     };
 
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(Timestamp {
         sec: ts.tv_sec as u32,
         nsec: ts.tv_nsec as u32,
@@ -80,11 +82,12 @@ fn get_monotonic_time() -> io::Result<Timestamp> {
 }
 
 /// Calculate duration between two monotonic timestamps.
-fn calculate_duration(start: &Timestamp, end: &Timestamp) -> Duration {
-    let start_sec = start.sec as u64;
-    let start_nsec = start.nsec as u64;
-    let end_sec = end.sec as u64;
-    let end_nsec = end.nsec as u64;
+#[allow(clippy::similar_names)]
+fn calculate_duration(start: Timestamp, end: Timestamp) -> Duration {
+    let start_sec = u64::from(start.sec);
+    let start_nsec = u64::from(start.nsec);
+    let end_sec = u64::from(end.sec);
+    let end_nsec = u64::from(end.nsec);
 
     let start_total_nsec = start_sec * 1_000_000_000 + start_nsec;
     let end_total_nsec = end_sec * 1_000_000_000 + end_nsec;
@@ -107,10 +110,13 @@ fn calculate_duration(start: &Timestamp, end: &Timestamp) -> Duration {
 /// * `Ok(Duration)` - Round-trip time if reply received
 /// * `Err(io::Error)` - If socket operations fail or timeout occurs
 ///
+/// # Errors
+/// Returns an error if socket operations fail, timeout occurs, or reply validation fails.
+///
 /// # Notes
 /// This function requires raw socket permissions (typically root/admin).
-/// For IPv6 destinations, sends ICMPv6 echo requests.
-/// For IPv4 destinations, sends ICMP echo requests.
+/// For `IPv6` destinations, sends `ICMPv6` echo requests.
+/// For `IPv4` destinations, sends ICMP echo requests.
 pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     match dest {
         IpAddr::V4(addr) => send_icmp_echo_v4(addr, payload, timeout),
@@ -118,7 +124,8 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
     }
 }
 
-/// Send an ICMPv4 echo request with the given payload and return the round-trip time.
+/// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
+#[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     // Create raw ICMP socket
     let sock = unsafe {
@@ -130,6 +137,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     // Set receive timeout
+    #[allow(clippy::cast_possible_wrap)]
     let timeval = libc::timeval {
         tv_sec: timeout.as_secs() as libc::time_t,
         tv_usec: timeout.subsec_micros() as libc::suseconds_t,
@@ -140,12 +148,49 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
             sock,
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
-            &timeval as *const _ as *const libc::c_void,
-            mem::size_of::<libc::timeval>() as libc::socklen_t,
+            (&raw const timeval).cast::<libc::c_void>(),
+            #[allow(clippy::cast_possible_truncation)]
+            { mem::size_of::<libc::timeval>() as libc::socklen_t },
         ) < 0
         {
             libc::close(sock);
             return Err(io::Error::last_os_error());
+        }
+    }
+
+    // Set Do Not Fragment bit
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            let val: libc::c_int = libc::IP_PMTUDISC_DO;
+            if libc::setsockopt(
+                sock,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                (&raw const val).cast::<libc::c_void>(),
+                #[allow(clippy::cast_possible_truncation)]
+                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+            ) < 0
+            {
+                libc::close(sock);
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let val: libc::c_int = 1;
+            if libc::setsockopt(
+                sock,
+                libc::IPPROTO_IP,
+                libc::IP_DONTFRAG,
+                (&raw const val).cast::<libc::c_void>(),
+                #[allow(clippy::cast_possible_truncation)]
+                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+            ) < 0
+            {
+                libc::close(sock);
+                return Err(io::Error::last_os_error());
+            }
         }
     }
 
@@ -165,7 +210,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Add header to packet
     unsafe {
         let header_bytes = std::slice::from_raw_parts(
-            &header as *const _ as *const u8,
+            (&raw const header).cast::<u8>(),
             mem::size_of::<IcmpHeader>(),
         );
         packet.extend_from_slice(header_bytes);
@@ -176,7 +221,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
     unsafe {
         let ts_bytes =
-            std::slice::from_raw_parts(&timestamp as *const _ as *const u8, timestamp_size);
+            std::slice::from_raw_parts((&raw const timestamp).cast::<u8>(), timestamp_size);
         packet.extend_from_slice(ts_bytes);
     }
 
@@ -189,6 +234,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     packet[3] = (checksum & 0xff) as u8;
 
     // Prepare destination address
+    #[allow(clippy::cast_possible_truncation)]
     let dest_addr = libc::sockaddr_in {
         #[cfg(any(
             target_os = "macos",
@@ -210,11 +256,12 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     let sent = unsafe {
         libc::sendto(
             sock,
-            packet.as_ptr() as *const libc::c_void,
+            packet.as_ptr().cast::<libc::c_void>(),
             packet.len(),
             0,
-            &dest_addr as *const _ as *const libc::sockaddr,
-            mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            (&raw const dest_addr).cast::<libc::sockaddr>(),
+            #[allow(clippy::cast_possible_truncation)]
+            { mem::size_of::<libc::sockaddr_in>() as libc::socklen_t },
         )
     };
 
@@ -226,16 +273,17 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Receive response
     let mut recv_buf = vec![0u8; 1024];
     let mut src_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
+    #[allow(clippy::cast_possible_truncation)]
     let mut src_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
     let received = unsafe {
         libc::recvfrom(
             sock,
-            recv_buf.as_mut_ptr() as *mut libc::c_void,
+            recv_buf.as_mut_ptr().cast::<libc::c_void>(),
             recv_buf.len(),
             0,
-            &mut src_addr as *mut _ as *mut libc::sockaddr,
-            &mut src_addr_len,
+            (&raw mut src_addr).cast::<libc::sockaddr>(),
+            &raw mut src_addr_len,
         )
     };
 
@@ -250,6 +298,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Parse response
     // IP header is typically 20 bytes, ICMP follows
+    #[allow(clippy::cast_sign_loss)]
     if (received as usize) < 28 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -260,6 +309,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Extract IP header length (lower 4 bits of first byte * 4)
     let ip_header_len = ((recv_buf[0] & 0x0f) * 4) as usize;
 
+    #[allow(clippy::cast_sign_loss)]
     if (received as usize) < ip_header_len + 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -270,15 +320,13 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Parse ICMP header from response
     let icmp_start = ip_header_len;
     let reply_type = recv_buf[icmp_start];
-    let _reply_code = recv_buf[icmp_start + 1];
     let reply_id = u16::from_be_bytes([recv_buf[icmp_start + 4], recv_buf[icmp_start + 5]]);
-    let _reply_seq = u16::from_be_bytes([recv_buf[icmp_start + 6], recv_buf[icmp_start + 7]]);
 
     // Verify this is our echo reply
     if reply_type != ICMP_ECHOREPLY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Unexpected ICMP type: {}", reply_type),
+            format!("Unexpected ICMP type: {reply_type}"),
         ));
     }
 
@@ -293,17 +341,18 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     let timestamp_offset = icmp_start + 8; // After ICMP header
     let timestamp_size = mem::size_of::<Timestamp>();
 
+    #[allow(clippy::cast_sign_loss)]
     if (received as usize) >= timestamp_offset + timestamp_size {
         let mut ts = Timestamp { sec: 0, nsec: 0 };
         unsafe {
             let ts_bytes =
-                std::slice::from_raw_parts_mut(&mut ts as *mut _ as *mut u8, timestamp_size);
+                std::slice::from_raw_parts_mut((&raw mut ts).cast::<u8>(), timestamp_size);
             ts_bytes
                 .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
         }
 
         // Calculate RTT from monotonic timestamps
-        let rtt = calculate_duration(&ts, &recv_time);
+        let rtt = calculate_duration(ts, recv_time);
 
         Ok(rtt)
     } else {
@@ -312,7 +361,8 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     }
 }
 
-/// Send an ICMPv6 echo request with the given payload and return the round-trip time.
+/// Send an `ICMPv6` echo request with the given payload and return the round-trip time.
+#[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
     // Create raw ICMPv6 socket
     let sock = unsafe {
@@ -324,6 +374,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     // Set receive timeout
+    #[allow(clippy::cast_possible_wrap)]
     let timeval = libc::timeval {
         tv_sec: timeout.as_secs() as libc::time_t,
         tv_usec: timeout.subsec_micros() as libc::suseconds_t,
@@ -334,12 +385,49 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
             sock,
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
-            &timeval as *const _ as *const libc::c_void,
-            mem::size_of::<libc::timeval>() as libc::socklen_t,
+            (&raw const timeval).cast::<libc::c_void>(),
+            #[allow(clippy::cast_possible_truncation)]
+            { mem::size_of::<libc::timeval>() as libc::socklen_t },
         ) < 0
         {
             libc::close(sock);
             return Err(io::Error::last_os_error());
+        }
+    }
+
+    // Set Do Not Fragment bit for IPv6
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            let val: libc::c_int = libc::IPV6_PMTUDISC_DO;
+            if libc::setsockopt(
+                sock,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                (&raw const val).cast::<libc::c_void>(),
+                #[allow(clippy::cast_possible_truncation)]
+                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+            ) < 0
+            {
+                libc::close(sock);
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let val: libc::c_int = 1;
+            if libc::setsockopt(
+                sock,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_DONTFRAG,
+                (&raw const val).cast::<libc::c_void>(),
+                #[allow(clippy::cast_possible_truncation)]
+                { mem::size_of::<libc::c_int>() as libc::socklen_t },
+            ) < 0
+            {
+                libc::close(sock);
+                return Err(io::Error::last_os_error());
+            }
         }
     }
 
@@ -359,7 +447,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // Add header to packet
     unsafe {
         let header_bytes = std::slice::from_raw_parts(
-            &header as *const _ as *const u8,
+            (&raw const header).cast::<u8>(),
             mem::size_of::<IcmpHeader>(),
         );
         packet.extend_from_slice(header_bytes);
@@ -370,7 +458,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     unsafe {
         let ts_bytes =
-            std::slice::from_raw_parts(&timestamp as *const _ as *const u8, timestamp_size);
+            std::slice::from_raw_parts((&raw const timestamp).cast::<u8>(), timestamp_size);
         packet.extend_from_slice(ts_bytes);
     }
 
@@ -381,6 +469,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // so we don't need to calculate it ourselves
 
     // Prepare destination address
+    #[allow(clippy::cast_possible_truncation)]
     let dest_addr = libc::sockaddr_in6 {
         #[cfg(any(
             target_os = "macos",
@@ -403,11 +492,12 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let sent = unsafe {
         libc::sendto(
             sock,
-            packet.as_ptr() as *const libc::c_void,
+            packet.as_ptr().cast::<libc::c_void>(),
             packet.len(),
             0,
-            &dest_addr as *const _ as *const libc::sockaddr,
-            mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            (&raw const dest_addr).cast::<libc::sockaddr>(),
+            #[allow(clippy::cast_possible_truncation)]
+            { mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t },
         )
     };
 
@@ -419,16 +509,17 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // Receive response
     let mut recv_buf = vec![0u8; 1024];
     let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+    #[allow(clippy::cast_possible_truncation)]
     let mut src_addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
 
     let received = unsafe {
         libc::recvfrom(
             sock,
-            recv_buf.as_mut_ptr() as *mut libc::c_void,
+            recv_buf.as_mut_ptr().cast::<libc::c_void>(),
             recv_buf.len(),
             0,
-            &mut src_addr as *mut _ as *mut libc::sockaddr,
-            &mut src_addr_len,
+            (&raw mut src_addr).cast::<libc::sockaddr>(),
+            &raw mut src_addr_len,
         )
     };
 
@@ -442,6 +533,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let recv_time = get_monotonic_time()?;
 
     // Parse ICMPv6 response (no IP header for ICMPv6 raw sockets)
+    #[allow(clippy::cast_sign_loss)]
     if (received as usize) < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -451,15 +543,13 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Parse ICMPv6 header from response
     let reply_type = recv_buf[0];
-    let _reply_code = recv_buf[1];
     let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
-    let _reply_seq = u16::from_be_bytes([recv_buf[6], recv_buf[7]]);
 
     // Verify this is our echo reply
     if reply_type != ICMP6_ECHO_REPLY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Unexpected ICMPv6 type: {}", reply_type),
+            format!("Unexpected ICMPv6 type: {reply_type}"),
         ));
     }
 
@@ -474,17 +564,18 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let timestamp_offset = 8; // After ICMPv6 header (no IP header for IPv6)
     let timestamp_size = mem::size_of::<Timestamp>();
 
+    #[allow(clippy::cast_sign_loss)]
     if (received as usize) >= timestamp_offset + timestamp_size {
         let mut ts = Timestamp { sec: 0, nsec: 0 };
         unsafe {
             let ts_bytes =
-                std::slice::from_raw_parts_mut(&mut ts as *mut _ as *mut u8, timestamp_size);
+                std::slice::from_raw_parts_mut((&raw mut ts).cast::<u8>(), timestamp_size);
             ts_bytes
                 .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
         }
 
         // Calculate RTT from monotonic timestamps
-        let rtt = calculate_duration(&ts, &recv_time);
+        let rtt = calculate_duration(ts, recv_time);
 
         Ok(rtt)
     } else {
@@ -500,14 +591,14 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 
     // Sum up 16-bit words
     while i < data.len() - 1 {
-        let word = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        let word = u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
         sum += word;
         i += 2;
     }
 
     // Add remaining byte if data length is odd
     if data.len() % 2 == 1 {
-        sum += (data[data.len() - 1] as u32) << 8;
+        sum += u32::from(data[data.len() - 1]) << 8;
     }
 
     // Fold 32-bit sum to 16 bits
@@ -516,7 +607,8 @@ fn calculate_checksum(data: &[u8]) -> u16 {
     }
 
     // Return one's complement
-    !sum as u16
+    #[allow(clippy::cast_possible_truncation)]
+    { !sum as u16 }
 }
 
 #[cfg(test)]
@@ -599,7 +691,7 @@ mod tests {
         let start = Timestamp { sec: 10, nsec: 500_000_000 };
         let end = Timestamp { sec: 12, nsec: 250_000_000 };
         
-        let duration = calculate_duration(&start, &end);
+        let duration = calculate_duration(start, end);
         
         // Should be 1.75 seconds (12.25 - 10.5)
         assert_eq!(duration.as_secs(), 1);
@@ -612,7 +704,7 @@ mod tests {
         let start = Timestamp { sec: 5, nsec: 100_000_000 };
         let end = Timestamp { sec: 5, nsec: 300_000_000 };
         
-        let duration = calculate_duration(&start, &end);
+        let duration = calculate_duration(start, end);
         
         // Should be 200ms
         assert_eq!(duration.as_millis(), 200);
@@ -623,7 +715,7 @@ mod tests {
         // Test zero duration
         let ts = Timestamp { sec: 10, nsec: 500_000_000 };
         
-        let duration = calculate_duration(&ts, &ts);
+        let duration = calculate_duration(ts, ts);
         
         assert_eq!(duration.as_nanos(), 0);
     }
@@ -634,7 +726,7 @@ mod tests {
         let start = Timestamp { sec: 12, nsec: 500_000_000 };
         let end = Timestamp { sec: 10, nsec: 250_000_000 };
         
-        let duration = calculate_duration(&start, &end);
+        let duration = calculate_duration(start, end);
         
         assert_eq!(duration.as_nanos(), 0);
     }
@@ -645,7 +737,7 @@ mod tests {
         let start = Timestamp { sec: 0, nsec: 1_000 };
         let end = Timestamp { sec: 0, nsec: 2_000 };
         
-        let duration = calculate_duration(&start, &end);
+        let duration = calculate_duration(start, end);
         
         assert_eq!(duration.as_nanos(), 1_000);
     }
