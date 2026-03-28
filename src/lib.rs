@@ -15,7 +15,7 @@ thread_local! {
 /// Get a machine-unique identifier for this thread.
 /// Combines process ID with a per-thread counter via XOR to ensure uniqueness
 /// across both threads and processes on the same machine.
-fn get_thread_id() -> u16 {
+fn get_echo_id() -> u16 {
     THREAD_ID.with(|id| {
         let current = id.get();
         if current == 0 {
@@ -32,8 +32,8 @@ fn get_thread_id() -> u16 {
     })
 }
 
-const ICMP_ECHO: u8 = 8;
-const ICMP_ECHOREPLY: u8 = 0;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 const ICMP6_ECHO_REPLY: u8 = 129;
 const IPPROTO_ICMP: libc::c_int = 1;
@@ -61,6 +61,50 @@ struct IcmpHeader {
 struct Timestamp {
     sec: u32,
     nsec: u32,
+}
+
+impl Timestamp {
+    /// Convert the timestamp to a byte slice.
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Timestamp).cast::<u8>(),
+                mem::size_of::<Timestamp>(),
+            )
+        }
+    }
+
+    /// Return the size of the Timestamp struct in bytes.
+    fn len() -> usize {
+        mem::size_of::<Timestamp>()
+    }
+}
+
+impl TryFrom<&[u8]> for Timestamp {
+    type Error = io::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        if bytes.len() != mem::size_of::<Timestamp>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid timestamp size: expected {}, got {}",
+                    mem::size_of::<Timestamp>(),
+                    bytes.len()
+                ),
+            ));
+        }
+
+        unsafe {
+            let mut ts = mem::MaybeUninit::<Timestamp>::uninit();
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                ts.as_mut_ptr().cast::<u8>(),
+                mem::size_of::<Timestamp>(),
+            );
+            Ok(ts.assume_init())
+        }
+    }
 }
 
 /// Get monotonic timestamp for accurate RTT measurement.
@@ -103,31 +147,6 @@ fn calculate_duration(start: Timestamp, end: Timestamp) -> Duration {
         Duration::from_nanos(end_total_nsec - start_total_nsec)
     } else {
         Duration::from_secs(0)
-    }
-}
-
-/// Send an ICMP echo request with the given payload and return the round-trip time.
-///
-/// # Arguments
-/// * `dest` - Destination IPv4 or IPv6 address
-/// * `payload` - Arbitrary payload data to include in the ICMP packet
-/// * `timeout` - Maximum time to wait for a reply
-///
-/// # Returns
-/// * `Ok(Duration)` - Round-trip time if reply received
-/// * `Err(io::Error)` - If socket operations fail or timeout occurs
-///
-/// # Errors
-/// Returns an error if socket operations fail, timeout occurs, or reply validation fails.
-///
-/// # Notes
-/// This function requires raw socket permissions (typically root/admin).
-/// For `IPv6` destinations, sends `ICMPv6` echo requests.
-/// For `IPv4` destinations, sends ICMP echo requests.
-pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    match dest {
-        IpAddr::V4(addr) => send_icmp_echo_v4(addr, payload, timeout),
-        IpAddr::V6(addr) => send_icmp_echo_v6(addr, payload, timeout),
     }
 }
 
@@ -222,6 +241,31 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64,
     Ok((avg, packet_loss))
 }
 
+/// Send an ICMP echo request with the given payload and return the round-trip time.
+///
+/// # Arguments
+/// * `dest` - Destination IPv4 or IPv6 address
+/// * `payload` - Arbitrary payload data to include in the ICMP packet
+/// * `timeout` - Maximum time to wait for a reply
+///
+/// # Returns
+/// * `Ok(Duration)` - Round-trip time if reply received
+/// * `Err(io::Error)` - If socket operations fail or timeout occurs
+///
+/// # Errors
+/// Returns an error if socket operations fail, timeout occurs, or reply validation fails.
+///
+/// # Notes
+/// This function requires raw socket permissions (typically root/admin).
+/// For `IPv6` destinations, sends `ICMPv6` echo requests.
+/// For `IPv4` destinations, sends ICMP echo requests.
+pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
+    match dest {
+        IpAddr::V4(addr) => send_icmp_echo_v4(addr, payload, timeout),
+        IpAddr::V6(addr) => send_icmp_echo_v6(addr, payload, timeout),
+    }
+}
+
 /// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
 #[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
@@ -304,10 +348,10 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
-        typ: ICMP_ECHO,
+        typ: ICMP_ECHO_REQUEST,
         code: 0,
         checksum: 0,
-        id: get_thread_id().to_be(),
+        id: get_echo_id().to_be(),
         sequence: seq.to_be(),
     };
 
@@ -323,11 +367,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Encode current monotonic time as timestamp (before user payload)
     let timestamp = get_monotonic_time()?;
 
-    unsafe {
-        let ts_bytes =
-            std::slice::from_raw_parts((&raw const timestamp).cast::<u8>(), timestamp_size);
-        packet.extend_from_slice(ts_bytes);
-    }
+    packet.extend_from_slice(timestamp.as_bytes());
 
     // Add user payload after timestamp
     packet.extend_from_slice(payload);
@@ -429,14 +469,14 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     let reply_id = u16::from_be_bytes([recv_buf[icmp_start + 4], recv_buf[icmp_start + 5]]);
 
     // Verify this is our echo reply
-    if reply_type != ICMP_ECHOREPLY {
+    if reply_type != ICMP_ECHO_REPLY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unexpected ICMP type: {reply_type}"),
         ));
     }
 
-    if reply_id != get_thread_id() {
+    if reply_id != get_echo_id() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ICMP ID mismatch",
@@ -445,17 +485,11 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = icmp_start + 8; // After ICMP header
-    let timestamp_size = mem::size_of::<Timestamp>();
+    let timestamp_size = Timestamp::len();
 
     #[allow(clippy::cast_sign_loss)]
     if (received as usize) >= timestamp_offset + timestamp_size {
-        let mut ts = Timestamp { sec: 0, nsec: 0 };
-        unsafe {
-            let ts_bytes =
-                std::slice::from_raw_parts_mut((&raw mut ts).cast::<u8>(), timestamp_size);
-            ts_bytes
-                .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
-        }
+        let ts = Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
         // Calculate RTT from monotonic timestamps
         let rtt = calculate_duration(ts, recv_time);
@@ -555,7 +589,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         typ: ICMP6_ECHO_REQUEST,
         code: 0,
         checksum: 0, // Kernel calculates checksum for ICMPv6
-        id: get_thread_id().to_be(),
+        id: get_echo_id().to_be(),
         sequence: seq.to_be(),
     };
 
@@ -571,11 +605,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // Encode current monotonic time as timestamp (before user payload)
     let timestamp = get_monotonic_time()?;
 
-    unsafe {
-        let ts_bytes =
-            std::slice::from_raw_parts((&raw const timestamp).cast::<u8>(), timestamp_size);
-        packet.extend_from_slice(ts_bytes);
-    }
+    packet.extend_from_slice(timestamp.as_bytes());
 
     // Add user payload after timestamp
     packet.extend_from_slice(payload);
@@ -624,7 +654,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     }
 
     // Receive response - loop to handle IPv6 raw sockets receiving own packets
-    let our_id = get_thread_id();
+    let our_id = get_echo_id();
     let recv_time;
     let mut recv_buf = vec![0u8; 1024];
     
@@ -677,17 +707,11 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = 8; // After ICMPv6 header (no IP header for IPv6)
-    let timestamp_size = mem::size_of::<Timestamp>();
+    let timestamp_size = Timestamp::len();
 
     // Extract timestamp from packet
     if recv_buf.len() >= timestamp_offset + timestamp_size {
-        let mut ts = Timestamp { sec: 0, nsec: 0 };
-        unsafe {
-            let ts_bytes =
-                std::slice::from_raw_parts_mut((&raw mut ts).cast::<u8>(), timestamp_size);
-            ts_bytes
-                .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
-        }
+        let ts = Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
         // Calculate RTT from monotonic timestamps
         let rtt = calculate_duration(ts, recv_time);
@@ -760,7 +784,7 @@ mod tests {
         for _ in 0..5 {
             let ids_clone = Arc::clone(&ids);
             let handle = thread::spawn(move || {
-                let id = get_thread_id();
+                let id = get_echo_id();
                 ids_clone.lock().unwrap().push(id);
             });
             handles.push(handle);
@@ -778,8 +802,8 @@ mod tests {
         assert_eq!(ids.len(), sorted_ids.len(), "Thread IDs should be unique");
 
         // Main thread should also have a consistent ID
-        let main_id1 = get_thread_id();
-        let main_id2 = get_thread_id();
+        let main_id1 = get_echo_id();
+        let main_id2 = get_echo_id();
         assert_eq!(main_id1, main_id2, "Same thread should return same ID");
     }
 
