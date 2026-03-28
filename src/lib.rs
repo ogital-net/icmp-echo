@@ -136,26 +136,10 @@ fn create_socket(domain: Domain, timeout: Duration) -> io::Result<Socket> {
             }
         }
         Domain::Ipv6 => {
-            // Tell kernel to calculate ICMPv6 checksum (Linux only)
-            // Note: On macOS/BSD, the kernel automatically calculates ICMPv6 checksums
-            // and the IPV6_CHECKSUM socket option is not supported
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let offset: libc::c_int = 2;
-                if libc::setsockopt(
-                    sock.as_fd(),
-                    IPPROTO_ICMPV6,
-                    libc::IPV6_CHECKSUM,
-                    (&raw const offset).cast::<libc::c_void>(),
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        mem::size_of::<libc::c_int>() as libc::socklen_t
-                    },
-                ) < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-            }
+            // Note: For IPPROTO_ICMPV6 raw sockets, the kernel automatically computes
+            // and verifies ICMPv6 checksums on all platforms (Linux, macOS, BSD).
+            // IPV6_CHECKSUM must NOT be set — it is only for non-ICMPv6 raw protocols
+            // and returns ENOPROTOOPT on ICMPv6 sockets.
 
             // Set Do Not Fragment bit for IPv6
             unsafe {
