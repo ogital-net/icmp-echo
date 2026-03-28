@@ -1,35 +1,140 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+#[macro_use]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+#[cfg(feature = "std")]
 use std::cell::Cell;
+#[cfg(feature = "std")]
 use std::io;
-use std::mem;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+
+use core::mem;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::sync::atomic::{AtomicU16, Ordering};
+use core::time::Duration;
+
+/// Minimal `io` shim for `no_std` environments, mirroring the parts of
+/// `std::io` used by this crate.
+#[cfg(not(feature = "std"))]
+mod io {
+    use core::result::Result as CoreResult;
+
+    pub type Result<T> = CoreResult<T, Error>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ErrorKind {
+        InvalidInput,
+        InvalidData,
+        TimedOut,
+        Other,
+    }
+
+    #[derive(Debug)]
+    pub struct Error {
+        pub(super) kind: ErrorKind,
+        pub(super) raw_os_error: Option<i32>,
+    }
+
+    impl core::fmt::Display for Error {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.raw_os_error {
+                Some(errno) => write!(f, "OS error {errno}"),
+                None => write!(f, "{:?}", self.kind),
+            }
+        }
+    }
+
+    impl Error {
+        pub fn last_os_error() -> Self {
+            Error {
+                kind: ErrorKind::Other,
+                raw_os_error: Some(super::get_errno()),
+            }
+        }
+
+        pub fn new<M>(kind: ErrorKind, _msg: M) -> Self {
+            Error {
+                kind,
+                raw_os_error: None,
+            }
+        }
+
+        pub fn kind(&self) -> ErrorKind {
+            self.kind
+        }
+    }
+}
+
+/// Read the current `errno` value (no_std only).
+#[cfg(not(feature = "std"))]
+fn get_errno() -> i32 {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *libc::__errno_location()
+        }
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        ))]
+        {
+            *libc::__error()
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        )))]
+        {
+            0
+        }
+    }
+}
 
 static SEQUENCE: AtomicU16 = AtomicU16::new(1);
 static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
 
+#[cfg(feature = "std")]
 thread_local! {
     static THREAD_ID: Cell<u16> = const { Cell::new(0) };
 }
 
-/// Get a machine-unique identifier for this thread.
-/// Combines process ID with a per-thread counter via XOR to ensure uniqueness
-/// across both threads and processes on the same machine.
+/// Get a machine-unique identifier for this echo request.
+/// In std mode: combines process ID with a per-thread counter via XOR.
+/// In no_std mode: combines process ID with a global counter via XOR.
 fn get_echo_id() -> u16 {
-    THREAD_ID.with(|id| {
-        let current = id.get();
-        if current == 0 {
-            let thread_num = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-            #[allow(clippy::cast_possible_truncation)]
-            let process_id = std::process::id() as u16;
-            // XOR thread number with process ID for machine-wide uniqueness
-            let unique_id = thread_num ^ process_id;
-            id.set(unique_id);
-            unique_id
-        } else {
-            current
-        }
-    })
+    #[cfg(feature = "std")]
+    {
+        THREAD_ID.with(|id| {
+            let current = id.get();
+            if current == 0 {
+                let thread_num = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                #[allow(clippy::cast_possible_truncation)]
+                let process_id = std::process::id() as u16;
+                // XOR thread number with process ID for machine-wide uniqueness
+                let unique_id = thread_num ^ process_id;
+                id.set(unique_id);
+                unique_id
+            } else {
+                current
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pid = unsafe { libc::getpid() } as u16;
+        counter ^ pid
+    }
 }
 
 const ICMP_ECHO_REQUEST: u8 = 8;
@@ -186,7 +291,7 @@ struct IcmpHeader {
 impl IcmpHeader {
     fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts((self as *const IcmpHeader).cast::<u8>(), IcmpHeader::len())
+            core::slice::from_raw_parts((self as *const IcmpHeader).cast::<u8>(), IcmpHeader::len())
         }
     }
 
@@ -212,7 +317,7 @@ impl TryFrom<&[u8]> for IcmpHeader {
 
         unsafe {
             let mut header = mem::MaybeUninit::<IcmpHeader>::uninit();
-            std::ptr::copy_nonoverlapping(
+            core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 header.as_mut_ptr().cast::<u8>(),
                 IcmpHeader::len(),
@@ -263,7 +368,7 @@ impl Timestamp {
     /// Convert the timestamp to a byte slice.
     fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts((self as *const Timestamp).cast::<u8>(), Timestamp::len())
+            core::slice::from_raw_parts((self as *const Timestamp).cast::<u8>(), Timestamp::len())
         }
     }
 
@@ -290,7 +395,7 @@ impl TryFrom<&[u8]> for Timestamp {
 
         unsafe {
             let mut ts = mem::MaybeUninit::<Timestamp>::uninit();
-            std::ptr::copy_nonoverlapping(
+            core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 ts.as_mut_ptr().cast::<u8>(),
                 Timestamp::len(),
@@ -300,7 +405,7 @@ impl TryFrom<&[u8]> for Timestamp {
     }
 }
 
-impl std::ops::Sub for Timestamp {
+impl core::ops::Sub for Timestamp {
     type Output = Duration;
 
     fn sub(self, rhs: Timestamp) -> Duration {
@@ -381,7 +486,16 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64,
 
         // Sleep between sends (except after the last one)
         if i < count - 1 {
+            #[cfg(feature = "std")]
             std::thread::sleep(Duration::from_millis(250));
+            #[cfg(not(feature = "std"))]
+            unsafe {
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 250_000_000,
+                };
+                libc::nanosleep(&ts, core::ptr::null_mut());
+            }
         }
     }
 
@@ -753,6 +867,13 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
+    // When the crate is compiled `no_std` the test binary still links std
+    // (cargo injects the std test harness), so we pull it in explicitly.
+    #[cfg(not(feature = "std"))]
+    extern crate std;
+    #[cfg(not(feature = "std"))]
+    use std::println;
+
     /// Check if the current process has permission to create raw sockets.
     /// Returns true if running as root (UID 0), false otherwise.
     fn has_raw_socket_permission() -> bool {
@@ -776,6 +897,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_thread_id_uniqueness() {
         use std::sync::{Arc, Mutex};
         use std::thread;
