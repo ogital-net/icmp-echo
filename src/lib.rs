@@ -1052,4 +1052,96 @@ mod tests {
             Err(e) => panic!("IPv6 2K ping failed: {}", e),
         }
     }
+
+    #[test]
+    fn test_ping_concurrent_threads() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_concurrent_threads: requires root privileges");
+            return;
+        }
+
+        const THREAD_COUNT: usize = 4;
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let mut handles = vec![];
+
+        for _ in 0..THREAD_COUNT {
+            let barrier = Arc::clone(&barrier);
+            let handle = thread::spawn(move || {
+                // All threads start sending at the same time
+                barrier.wait();
+
+                let dest = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+                let payload = b"threaded ping";
+                let timeout = Duration::from_secs(5);
+
+                send_icmp_echo(dest, payload, timeout)
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        // Every thread should receive a valid reply
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(rtt) => {
+                    println!("Thread {} RTT: {:?}", i, rtt);
+                    assert!(*rtt < Duration::from_secs(5), "RTT should be under timeout");
+                }
+                Err(e) => panic!("Thread {} ping failed: {}", i, e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_ping_concurrent_threads_v6() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        if !has_raw_socket_permission() {
+            println!("Skipping test_ping_concurrent_threads_v6: requires root privileges");
+            return;
+        }
+
+        const THREAD_COUNT: usize = 4;
+        let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+        let mut handles = vec![];
+
+        for _ in 0..THREAD_COUNT {
+            let barrier = Arc::clone(&barrier);
+            let handle = thread::spawn(move || {
+                // All threads start sending at the same time
+                barrier.wait();
+
+                let dest = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+                let payload = b"threaded ping";
+                let timeout = Duration::from_secs(5);
+
+                send_icmp_echo(dest, payload, timeout)
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        // Every thread should receive a valid reply
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(rtt) => {
+                    println!("Thread {} RTT: {:?}", i, rtt);
+                    assert!(*rtt < Duration::from_secs(5), "RTT should be under timeout");
+                }
+                Err(e) => panic!("Thread {} ping failed: {}", i, e),
+            }
+        }
+    }
 }
