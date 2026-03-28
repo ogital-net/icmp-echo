@@ -1,7 +1,10 @@
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::Duration;
+
+static SEQUENCE: AtomicU16 = AtomicU16::new(0);
 
 const ICMP_ECHO: u8 = 8;
 const ICMP_ECHOREPLY: u8 = 0;
@@ -18,6 +21,54 @@ struct IcmpHeader {
     checksum: u16,
     id: u16,
     sequence: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct Timestamp {
+    sec: u32,
+    nsec: u32,
+}
+
+/// Get monotonic timestamp for accurate RTT measurement.
+/// Uses CLOCK_MONOTONIC which is not affected by system clock adjustments.
+fn get_monotonic_time() -> io::Result<Timestamp> {
+    let mut ts: libc::timespec = unsafe { mem::zeroed() };
+
+    let result = unsafe {
+        #[cfg(target_os = "macos")]
+        let clock_id = libc::CLOCK_MONOTONIC;
+        #[cfg(target_os = "linux")]
+        let clock_id = libc::CLOCK_MONOTONIC;
+
+        libc::clock_gettime(clock_id, &mut ts)
+    };
+
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(Timestamp {
+        sec: (ts.tv_sec as u32).to_be(),
+        nsec: (ts.tv_nsec as u32).to_be(),
+    })
+}
+
+/// Calculate duration between two monotonic timestamps.
+fn calculate_duration(start: &Timestamp, end: &Timestamp) -> Duration {
+    let start_sec = u32::from_be(start.sec) as u64;
+    let start_nsec = u32::from_be(start.nsec) as u64;
+    let end_sec = u32::from_be(end.sec) as u64;
+    let end_nsec = u32::from_be(end.nsec) as u64;
+
+    let start_total_nsec = start_sec * 1_000_000_000 + start_nsec;
+    let end_total_nsec = end_sec * 1_000_000_000 + end_nsec;
+
+    if end_total_nsec >= start_total_nsec {
+        Duration::from_nanos(end_total_nsec - start_total_nsec)
+    } else {
+        Duration::from_secs(0)
+    }
 }
 
 /// Send an ICMP echo request with the given payload and return the round-trip time.
@@ -73,15 +124,17 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         }
     }
 
-    // Build ICMP packet
-    let mut packet = Vec::with_capacity(8 + payload.len());
+    // Build ICMP packet with timestamp
+    let timestamp_size = mem::size_of::<Timestamp>();
+    let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
 
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
         typ: ICMP_ECHO,
         code: 0,
         checksum: 0,
         id: (std::process::id() as u16).to_be(),
-        sequence: 1u16.to_be(),
+        sequence: seq.to_be(),
     };
 
     // Add header to packet
@@ -93,7 +146,16 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         packet.extend_from_slice(header_bytes);
     }
 
-    // Add payload
+    // Encode current monotonic time as timestamp (before user payload)
+    let timestamp = get_monotonic_time()?;
+
+    unsafe {
+        let ts_bytes =
+            std::slice::from_raw_parts(&timestamp as *const _ as *const u8, timestamp_size);
+        packet.extend_from_slice(ts_bytes);
+    }
+
+    // Add user payload after timestamp
     packet.extend_from_slice(payload);
 
     // Calculate checksum
@@ -118,9 +180,6 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         },
         sin_zero: [0; 8],
     };
-
-    // Record start time
-    let start = Instant::now();
 
     // Send packet
     let sent = unsafe {
@@ -161,8 +220,8 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         return Err(io::Error::last_os_error());
     }
 
-    // Record end time
-    let rtt = start.elapsed();
+    // Get current monotonic time for RTT calculation
+    let recv_time = get_monotonic_time()?;
 
     // Parse response
     // IP header is typically 20 bytes, ICMP follows
@@ -205,7 +264,27 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         ));
     }
 
-    Ok(rtt)
+    // Decode timestamp from reply data to calculate actual RTT
+    let timestamp_offset = icmp_start + 8; // After ICMP header
+    let timestamp_size = mem::size_of::<Timestamp>();
+
+    if (received as usize) >= timestamp_offset + timestamp_size {
+        let mut ts = Timestamp { sec: 0, nsec: 0 };
+        unsafe {
+            let ts_bytes =
+                std::slice::from_raw_parts_mut(&mut ts as *mut _ as *mut u8, timestamp_size);
+            ts_bytes
+                .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
+        }
+
+        // Calculate RTT from monotonic timestamps
+        let rtt = calculate_duration(&ts, &recv_time);
+
+        Ok(rtt)
+    } else {
+        // Fallback: no timestamp in packet (shouldn't happen with our packets)
+        Ok(Duration::from_secs(0))
+    }
 }
 
 /// Send an ICMPv6 echo request with the given payload and return the round-trip time.
@@ -239,15 +318,17 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         }
     }
 
-    // Build ICMPv6 packet
-    let mut packet = Vec::with_capacity(8 + payload.len());
+    // Build ICMPv6 packet with timestamp
+    let timestamp_size = mem::size_of::<Timestamp>();
+    let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
 
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
         typ: ICMP6_ECHO_REQUEST,
         code: 0,
         checksum: 0, // Kernel calculates checksum for ICMPv6
         id: (std::process::id() as u16).to_be(),
-        sequence: 1u16.to_be(),
+        sequence: seq.to_be(),
     };
 
     // Add header to packet
@@ -259,7 +340,16 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         packet.extend_from_slice(header_bytes);
     }
 
-    // Add payload
+    // Encode current monotonic time as timestamp (before user payload)
+    let timestamp = get_monotonic_time()?;
+
+    unsafe {
+        let ts_bytes =
+            std::slice::from_raw_parts(&timestamp as *const _ as *const u8, timestamp_size);
+        packet.extend_from_slice(ts_bytes);
+    }
+
+    // Add user payload after timestamp
     packet.extend_from_slice(payload);
 
     // Note: For IPv6, the kernel automatically calculates the ICMPv6 checksum
@@ -283,9 +373,6 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         },
         sin6_scope_id: 0,
     };
-
-    // Record start time
-    let start = Instant::now();
 
     // Send packet
     let sent = unsafe {
@@ -326,8 +413,8 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         return Err(io::Error::last_os_error());
     }
 
-    // Record end time
-    let rtt = start.elapsed();
+    // Get current monotonic time for RTT calculation
+    let recv_time = get_monotonic_time()?;
 
     // Parse ICMPv6 response (no IP header for ICMPv6 raw sockets)
     if (received as usize) < 8 {
@@ -358,7 +445,27 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         ));
     }
 
-    Ok(rtt)
+    // Decode timestamp from reply data to calculate actual RTT
+    let timestamp_offset = 8; // After ICMPv6 header (no IP header for IPv6)
+    let timestamp_size = mem::size_of::<Timestamp>();
+
+    if (received as usize) >= timestamp_offset + timestamp_size {
+        let mut ts = Timestamp { sec: 0, nsec: 0 };
+        unsafe {
+            let ts_bytes =
+                std::slice::from_raw_parts_mut(&mut ts as *mut _ as *mut u8, timestamp_size);
+            ts_bytes
+                .copy_from_slice(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size]);
+        }
+
+        // Calculate RTT from monotonic timestamps
+        let rtt = calculate_duration(&ts, &recv_time);
+
+        Ok(rtt)
+    } else {
+        // Fallback: no timestamp in packet (shouldn't happen with our packets)
+        Ok(Duration::from_secs(0))
+    }
 }
 
 /// Calculate Internet Checksum (RFC 1071)
