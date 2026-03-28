@@ -46,6 +46,151 @@ fn has_raw_socket_permission() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+struct Socket(i32);
+
+impl Socket {
+    fn as_fd(&self) -> i32 {
+        self.0
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+enum Domain {
+    Ipv4,
+    Ipv6,
+}
+
+fn create_socket(domain: Domain, timeout: Duration) -> io::Result<Socket> {
+    let (af, protocol) = match domain {
+        Domain::Ipv4 => (libc::AF_INET, IPPROTO_ICMP),
+        Domain::Ipv6 => (libc::AF_INET6, IPPROTO_ICMPV6),
+    };
+
+    let sock = unsafe {
+        let fd = libc::socket(af, libc::SOCK_RAW, protocol);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Socket(fd)
+    };
+
+    // Set receive timeout
+    #[allow(clippy::cast_possible_wrap)]
+    let timeval = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+
+    unsafe {
+        if libc::setsockopt(
+            sock.as_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const timeval).cast::<libc::c_void>(),
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                mem::size_of::<libc::timeval>() as libc::socklen_t
+            },
+        ) < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    match domain {
+        Domain::Ipv4 => {
+            // Set Do Not Fragment bit
+            unsafe {
+                #[cfg(target_os = "linux")]
+                {
+                    let val: libc::c_int = libc::IP_PMTUDISC_DO;
+                    if libc::setsockopt(
+                        sock.as_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_MTU_DISCOVER,
+                        (&raw const val).cast::<libc::c_void>(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            mem::size_of::<libc::c_int>() as libc::socklen_t
+                        },
+                    ) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let val: libc::c_int = 1;
+                    if libc::setsockopt(
+                        sock.as_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_DONTFRAG,
+                        (&raw const val).cast::<libc::c_void>(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            mem::size_of::<libc::c_int>() as libc::socklen_t
+                        },
+                    ) < 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+            }
+        }
+        Domain::Ipv6 => {
+            // Tell kernel to calculate ICMPv6 checksum (Linux only)
+            // Note: On macOS/BSD, the kernel automatically calculates ICMPv6 checksums
+            // and the IPV6_CHECKSUM socket option is not supported
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let offset: libc::c_int = 2;
+                if libc::setsockopt(
+                    sock.as_fd(),
+                    IPPROTO_ICMPV6,
+                    libc::IPV6_CHECKSUM,
+                    (&raw const offset).cast::<libc::c_void>(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        mem::size_of::<libc::c_int>() as libc::socklen_t
+                    },
+                ) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+
+            // Set Do Not Fragment bit for IPv6
+            unsafe {
+                #[cfg(target_os = "linux")]
+                let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO);
+                #[cfg(not(target_os = "linux"))]
+                let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1 as libc::c_int);
+
+                if libc::setsockopt(
+                    sock.as_fd(),
+                    level,
+                    optname,
+                    (&raw const val).cast::<libc::c_void>(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        mem::size_of::<libc::c_int>() as libc::socklen_t
+                    },
+                ) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
+    }
+
+    Ok(sock)
+}
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct IcmpHeader {
@@ -265,78 +410,7 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
 /// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
 #[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    // Create raw ICMP socket
-    let sock = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_RAW, IPPROTO_ICMP);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        fd
-    };
-
-    // Set receive timeout
-    #[allow(clippy::cast_possible_wrap)]
-    let timeval = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
-    };
-
-    unsafe {
-        if libc::setsockopt(
-            sock,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const timeval).cast::<libc::c_void>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::timeval>() as libc::socklen_t
-            },
-        ) < 0
-        {
-            libc::close(sock);
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    // Set Do Not Fragment bit
-    unsafe {
-        #[cfg(target_os = "linux")]
-        {
-            let val: libc::c_int = libc::IP_PMTUDISC_DO;
-            if libc::setsockopt(
-                sock,
-                libc::IPPROTO_IP,
-                libc::IP_MTU_DISCOVER,
-                (&raw const val).cast::<libc::c_void>(),
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    mem::size_of::<libc::c_int>() as libc::socklen_t
-                },
-            ) < 0
-            {
-                libc::close(sock);
-                return Err(io::Error::last_os_error());
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let val: libc::c_int = 1;
-            if libc::setsockopt(
-                sock,
-                libc::IPPROTO_IP,
-                libc::IP_DONTFRAG,
-                (&raw const val).cast::<libc::c_void>(),
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    mem::size_of::<libc::c_int>() as libc::socklen_t
-                },
-            ) < 0
-            {
-                libc::close(sock);
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
+    let sock = create_socket(Domain::Ipv4, timeout)?;
 
     // Build ICMP packet with timestamp
     let timestamp_size = mem::size_of::<Timestamp>();
@@ -395,7 +469,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     // Send packet
     let sent = unsafe {
         libc::sendto(
-            sock,
+            sock.as_fd(),
             packet.as_ptr().cast::<libc::c_void>(),
             packet.len(),
             0,
@@ -408,7 +482,6 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     if sent < 0 {
-        unsafe { libc::close(sock) };
         return Err(io::Error::last_os_error());
     }
 
@@ -426,7 +499,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
         let received = unsafe {
             libc::recvfrom(
-                sock,
+                sock.as_fd(),
                 recv_buf.as_mut_ptr().cast::<libc::c_void>(),
                 recv_buf.len(),
                 0,
@@ -436,7 +509,6 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         };
 
         if received < 0 {
-            unsafe { libc::close(sock) };
             return Err(io::Error::last_os_error());
         }
 
@@ -471,8 +543,6 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         break;
     }
 
-    unsafe { libc::close(sock) };
-
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = icmp_start + 8; // After ICMP header
     let timestamp_size = Timestamp::len();
@@ -494,83 +564,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 /// Send an `ICMPv6` echo request with the given payload and return the round-trip time.
 #[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
-    // Create raw ICMPv6 socket
-    let sock = unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_RAW, IPPROTO_ICMPV6);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        fd
-    };
-
-    // Set receive timeout
-    #[allow(clippy::cast_possible_wrap)]
-    let timeval = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
-    };
-
-    unsafe {
-        if libc::setsockopt(
-            sock,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const timeval).cast::<libc::c_void>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::timeval>() as libc::socklen_t
-            },
-        ) < 0
-        {
-            libc::close(sock);
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    // Tell kernel to calculate ICMPv6 checksum (Linux only)
-    // Note: On macOS/BSD, the kernel automatically calculates ICMPv6 checksums
-    // and the IPV6_CHECKSUM socket option is not supported
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let offset: libc::c_int = 2;
-        if libc::setsockopt(
-            sock,
-            IPPROTO_ICMPV6,
-            libc::IPV6_CHECKSUM,
-            (&raw const offset).cast::<libc::c_void>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::c_int>() as libc::socklen_t
-            },
-        ) < 0
-        {
-            libc::close(sock);
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    // Set Do Not Fragment bit for IPv6
-    unsafe {
-        #[cfg(target_os = "linux")]
-        let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO);
-        #[cfg(not(target_os = "linux"))]
-        let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1 as libc::c_int);
-
-        if libc::setsockopt(
-            sock,
-            level,
-            optname,
-            (&raw const val).cast::<libc::c_void>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::c_int>() as libc::socklen_t
-            },
-        ) < 0
-        {
-            libc::close(sock);
-            return Err(io::Error::last_os_error());
-        }
-    }
+    let sock = create_socket(Domain::Ipv6, timeout)?;
 
     // Build ICMPv6 packet with timestamp
     let timestamp_size = mem::size_of::<Timestamp>();
@@ -628,7 +622,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // Send packet
     let sent = unsafe {
         libc::sendto(
-            sock,
+            sock.as_fd(),
             packet.as_ptr().cast::<libc::c_void>(),
             packet.len(),
             0,
@@ -641,7 +635,6 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     if sent < 0 {
-        unsafe { libc::close(sock) };
         return Err(io::Error::last_os_error());
     }
 
@@ -657,7 +650,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
         let received = unsafe {
             libc::recvfrom(
-                sock,
+                sock.as_fd(),
                 recv_buf.as_mut_ptr().cast::<libc::c_void>(),
                 recv_buf.len(),
                 0,
@@ -667,7 +660,6 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         };
 
         if received < 0 {
-            unsafe { libc::close(sock) };
             return Err(io::Error::last_os_error());
         }
 
@@ -694,8 +686,6 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         recv_time = Timestamp::now();
         break;
     }
-
-    unsafe { libc::close(sock) };
 
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = 8; // After ICMPv6 header (no IP header for IPv6)
