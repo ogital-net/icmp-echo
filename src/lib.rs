@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-static SEQUENCE: AtomicU16 = AtomicU16::new(0);
+static SEQUENCE: AtomicU16 = AtomicU16::new(1);
 static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
 
 thread_local! {
@@ -64,6 +64,31 @@ struct Timestamp {
 }
 
 impl Timestamp {
+    /// Get the current monotonic time as a Timestamp.
+    /// Uses `CLOCK_MONOTONIC` which is not affected by system clock adjustments.
+    fn now() -> Self {
+        let mut ts = mem::MaybeUninit::<libc::timespec>::uninit();
+
+        let result = unsafe {
+            #[cfg(target_vendor = "apple")]
+            let clock_id = libc::CLOCK_UPTIME_RAW;
+            #[cfg(not(target_vendor = "apple"))]
+            let clock_id = libc::CLOCK_MONOTONIC;
+
+            libc::clock_gettime(clock_id, ts.as_mut_ptr())
+        };
+
+        assert_eq!(result, 0, "clock_gettime failed: {}", io::Error::last_os_error());
+
+        let ts = unsafe { ts.assume_init() };
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Timestamp {
+            sec: ts.tv_sec as u32,
+            nsec: ts.tv_nsec as u32,
+        }
+    }
+
     /// Convert the timestamp to a byte slice.
     fn as_bytes(&self) -> &[u8] {
         unsafe {
@@ -107,47 +132,25 @@ impl TryFrom<&[u8]> for Timestamp {
     }
 }
 
-/// Get monotonic timestamp for accurate RTT measurement.
-/// Uses `CLOCK_MONOTONIC` which is not affected by system clock adjustments.
-fn get_monotonic_time() -> io::Result<Timestamp> {
-    let mut ts: libc::timespec = unsafe { mem::zeroed() };
+impl std::ops::Sub for Timestamp {
+    type Output = Duration;
 
-    let result = unsafe {
-        #[cfg(target_vendor = "apple")]
-        let clock_id = libc::CLOCK_UPTIME_RAW;
-        #[cfg(not(target_vendor = "apple"))]
-        let clock_id = libc::CLOCK_MONOTONIC;
+    fn sub(self, rhs: Timestamp) -> Duration {
+        let self_total_nsec = u64::from(self.sec) * 1_000_000_000 + u64::from(self.nsec);
+        let rhs_total_nsec = u64::from(rhs.sec) * 1_000_000_000 + u64::from(rhs.nsec);
 
-        libc::clock_gettime(clock_id, &raw mut ts)
-    };
-
-    if result != 0 {
-        return Err(io::Error::last_os_error());
+        if self_total_nsec >= rhs_total_nsec {
+            Duration::from_nanos(self_total_nsec - rhs_total_nsec)
+        } else {
+            Duration::from_secs(0)
+        }
     }
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(Timestamp {
-        sec: ts.tv_sec as u32,
-        nsec: ts.tv_nsec as u32,
-    })
 }
 
-/// Calculate duration between two monotonic timestamps.
-#[allow(clippy::similar_names)]
-fn calculate_duration(start: Timestamp, end: Timestamp) -> Duration {
-    let start_sec = u64::from(start.sec);
-    let start_nsec = u64::from(start.nsec);
-    let end_sec = u64::from(end.sec);
-    let end_nsec = u64::from(end.nsec);
-
-    let start_total_nsec = start_sec * 1_000_000_000 + start_nsec;
-    let end_total_nsec = end_sec * 1_000_000_000 + end_nsec;
-
-    if end_total_nsec >= start_total_nsec {
-        Duration::from_nanos(end_total_nsec - start_total_nsec)
-    } else {
-        Duration::from_secs(0)
-    }
+/// Generate a ping payload
+#[allow(clippy::cast_possible_truncation)]
+pub fn generate_payload(size: usize) -> Vec<u8> {
+    (0..size).map(|i| (i % 256) as u8).collect()
 }
 
 /// Send multiple ICMP echo requests and return the average round-trip time and packet loss.
@@ -195,14 +198,7 @@ pub fn ping(dest: IpAddr, payload_size: usize, count: usize) -> io::Result<(f64,
         ));
     }
 
-    // Generate payload with sequential byte pattern (like standard ping)
-    // The first 8 bytes are reserved for the timestamp (handled by send_icmp_echo)
-    let user_payload_size = payload_size - 8;
-    let mut payload = Vec::with_capacity(user_payload_size);
-    for i in 0..user_payload_size {
-        #[allow(clippy::cast_possible_truncation)]
-        payload.push(((i + 8) % 256) as u8);
-    }
+    let payload = generate_payload(payload_size - 8);
 
     // Send echo requests and collect successful RTTs
     let timeout = Duration::from_secs(5);
@@ -365,7 +361,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     }
 
     // Encode current monotonic time as timestamp (before user payload)
-    let timestamp = get_monotonic_time()?;
+    let timestamp = Timestamp::now();
 
     packet.extend_from_slice(timestamp.as_bytes());
 
@@ -416,83 +412,77 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         return Err(io::Error::last_os_error());
     }
 
-    // Receive response
+    // Receive response - loop to skip packets that aren't our echo reply
+    // (raw sockets receive all ICMP packets, including our own echo request on loopback)
+    let our_id = get_echo_id();
+    let recv_time;
     let mut recv_buf = vec![0u8; 1024];
-    let mut src_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-    #[allow(clippy::cast_possible_truncation)]
-    let mut src_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let icmp_start;
 
-    let received = unsafe {
-        libc::recvfrom(
-            sock,
-            recv_buf.as_mut_ptr().cast::<libc::c_void>(),
-            recv_buf.len(),
-            0,
-            (&raw mut src_addr).cast::<libc::sockaddr>(),
-            &raw mut src_addr_len,
-        )
-    };
+    loop {
+        let mut src_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
+        #[allow(clippy::cast_possible_truncation)]
+        let mut src_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+        let received = unsafe {
+            libc::recvfrom(
+                sock,
+                recv_buf.as_mut_ptr().cast::<libc::c_void>(),
+                recv_buf.len(),
+                0,
+                (&raw mut src_addr).cast::<libc::sockaddr>(),
+                &raw mut src_addr_len,
+            )
+        };
+
+        if received < 0 {
+            unsafe { libc::close(sock) };
+            return Err(io::Error::last_os_error());
+        }
+
+        // IP header is 20 bytes, ICMP follows
+        #[allow(clippy::cast_sign_loss)]
+        if (received as usize) < 28 {
+            continue; // Too short, wait for next packet
+        }
+
+        // Extract IP header length (lower 4 bits of first byte * 4)
+        let ip_hlen = ((recv_buf[0] & 0x0f) * 4) as usize;
+
+        #[allow(clippy::cast_sign_loss)]
+        if (received as usize) < ip_hlen + 8 {
+            continue; // Truncated header, wait for next packet
+        }
+
+        let reply_type = recv_buf[ip_hlen];
+        let reply_id = u16::from_be_bytes([recv_buf[ip_hlen + 4], recv_buf[ip_hlen + 5]]);
+
+        if reply_type != ICMP_ECHO_REPLY {
+            continue; // Not an echo reply, wait for next packet
+        }
+
+        if reply_id != our_id {
+            continue; // Not our packet, wait for next packet
+        }
+
+        // Found our echo reply
+        recv_time = Timestamp::now();
+        icmp_start = ip_hlen;
+        break;
+    }
 
     unsafe { libc::close(sock) };
-
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Get current monotonic time for RTT calculation
-    let recv_time = get_monotonic_time()?;
-
-    // Parse response
-    // IP header is typically 20 bytes, ICMP follows
-    #[allow(clippy::cast_sign_loss)]
-    if (received as usize) < 28 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Response too short",
-        ));
-    }
-
-    // Extract IP header length (lower 4 bits of first byte * 4)
-    let ip_header_len = ((recv_buf[0] & 0x0f) * 4) as usize;
-
-    #[allow(clippy::cast_sign_loss)]
-    if (received as usize) < ip_header_len + 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid IP header length",
-        ));
-    }
-
-    // Parse ICMP header from response
-    let icmp_start = ip_header_len;
-    let reply_type = recv_buf[icmp_start];
-    let reply_id = u16::from_be_bytes([recv_buf[icmp_start + 4], recv_buf[icmp_start + 5]]);
-
-    // Verify this is our echo reply
-    if reply_type != ICMP_ECHO_REPLY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unexpected ICMP type: {reply_type}"),
-        ));
-    }
-
-    if reply_id != get_echo_id() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP ID mismatch",
-        ));
-    }
 
     // Decode timestamp from reply data to calculate actual RTT
     let timestamp_offset = icmp_start + 8; // After ICMP header
     let timestamp_size = Timestamp::len();
 
-    #[allow(clippy::cast_sign_loss)]
-    if (received as usize) >= timestamp_offset + timestamp_size {
-        let ts = Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
+    if recv_buf.len() >= timestamp_offset + timestamp_size {
+        let ts =
+            Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
         // Calculate RTT from monotonic timestamps
-        let rtt = calculate_duration(ts, recv_time);
+        let rtt = recv_time - ts;
 
         Ok(rtt)
     } else {
@@ -559,15 +549,17 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         }
     }
 
-    // Set Do Not Fragment bit for IPv6 (Linux only)
-    // Note: macOS/BSD don't support IPV6_DONTFRAG for raw sockets
-    #[cfg(target_os = "linux")]
+    // Set Do Not Fragment bit for IPv6
     unsafe {
-        let val: libc::c_int = libc::IPV6_PMTUDISC_DO;
+        #[cfg(target_os = "linux")]
+        let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, libc::IPV6_PMTUDISC_DO);
+        #[cfg(not(target_os = "linux"))]
+        let (level, optname, val) = (libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1 as libc::c_int);
+
         if libc::setsockopt(
             sock,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MTU_DISCOVER,
+            level,
+            optname,
             (&raw const val).cast::<libc::c_void>(),
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -603,7 +595,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     }
 
     // Encode current monotonic time as timestamp (before user payload)
-    let timestamp = get_monotonic_time()?;
+    let timestamp = Timestamp::now();
 
     packet.extend_from_slice(timestamp.as_bytes());
 
@@ -657,7 +649,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let our_id = get_echo_id();
     let recv_time;
     let mut recv_buf = vec![0u8; 1024];
-    
+
     loop {
         let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
         #[allow(clippy::cast_possible_truncation)]
@@ -693,13 +685,13 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         if reply_type != ICMP6_ECHO_REPLY {
             continue; // Not an echo reply, wait for next packet
         }
-        
+
         if reply_id != our_id {
             continue; // Not our packet, wait for next packet
         }
 
         // Found our echo reply!
-        recv_time = get_monotonic_time()?;
+        recv_time = Timestamp::now();
         break;
     }
 
@@ -711,10 +703,11 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Extract timestamp from packet
     if recv_buf.len() >= timestamp_offset + timestamp_size {
-        let ts = Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
+        let ts =
+            Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
         // Calculate RTT from monotonic timestamps
-        let rtt = calculate_duration(ts, recv_time);
+        let rtt = recv_time - ts;
 
         Ok(rtt)
     } else {
@@ -808,9 +801,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_monotonic_time() {
+    fn test_timestamp_now() {
         // Test that we can get a monotonic timestamp
-        let ts1 = get_monotonic_time().expect("Failed to get monotonic time");
+        let ts1 = Timestamp::now();
 
         // Verify fields are reasonable (not zero and not maxed out)
         assert!(ts1.sec > 0, "Seconds should be non-zero");
@@ -821,7 +814,7 @@ mod tests {
 
         // Get another timestamp and verify time moves forward
         std::thread::sleep(Duration::from_millis(10));
-        let ts2 = get_monotonic_time().expect("Failed to get monotonic time");
+        let ts2 = Timestamp::now();
 
         // Second timestamp should be greater than first
         let total1 = (ts1.sec as u64) * 1_000_000_000 + (ts1.nsec as u64);
@@ -830,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_duration() {
+    fn test_sub_timestamp() {
         // Test basic duration calculation
         let start = Timestamp {
             sec: 10,
@@ -841,7 +834,7 @@ mod tests {
             nsec: 250_000_000,
         };
 
-        let duration = calculate_duration(start, end);
+        let duration = end - start;
 
         // Should be 1.75 seconds (12.25 - 10.5)
         assert_eq!(duration.as_secs(), 1);
@@ -849,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_duration_same_second() {
+    fn test_sub_timestamp_same_second() {
         // Test duration within same second
         let start = Timestamp {
             sec: 5,
@@ -860,27 +853,27 @@ mod tests {
             nsec: 300_000_000,
         };
 
-        let duration = calculate_duration(start, end);
+        let duration = end - start;
 
         // Should be 200ms
         assert_eq!(duration.as_millis(), 200);
     }
 
     #[test]
-    fn test_calculate_duration_zero() {
+    fn test_sub_timestamp_zero() {
         // Test zero duration
         let ts = Timestamp {
             sec: 10,
             nsec: 500_000_000,
         };
 
-        let duration = calculate_duration(ts, ts);
+        let duration = ts - ts;
 
         assert_eq!(duration.as_nanos(), 0);
     }
 
     #[test]
-    fn test_calculate_duration_backwards() {
+    fn test_sub_timestamp_backwards() {
         // Test that backwards time gives zero (shouldn't happen with monotonic clock)
         let start = Timestamp {
             sec: 12,
@@ -891,13 +884,13 @@ mod tests {
             nsec: 250_000_000,
         };
 
-        let duration = calculate_duration(start, end);
+        let duration = end - start;
 
         assert_eq!(duration.as_nanos(), 0);
     }
 
     #[test]
-    fn test_calculate_duration_microsecond_precision() {
+    fn test_sub_timestamp_microsecond_precision() {
         // Test microsecond-level precision
         let start = Timestamp {
             sec: 0,
@@ -908,7 +901,7 @@ mod tests {
             nsec: 2_000,
         };
 
-        let duration = calculate_duration(start, end);
+        let duration = end - start;
 
         assert_eq!(duration.as_nanos(), 1_000);
     }
@@ -980,7 +973,10 @@ mod tests {
         let dest = "127.0.0.1".parse().unwrap();
         match ping(dest, 56, 3) {
             Ok((avg_rtt, packet_loss)) => {
-                println!("Average RTT: {:.3} ms, Packet Loss: {:.1}%", avg_rtt, packet_loss);
+                println!(
+                    "Average RTT: {:.3} ms, Packet Loss: {:.1}%",
+                    avg_rtt, packet_loss
+                );
                 assert!(avg_rtt > 0.0);
                 assert!(avg_rtt < 1000.0); // Should be less than 1 second
                 assert!((0.0..=100.0).contains(&packet_loss));
