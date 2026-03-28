@@ -446,6 +446,82 @@ pub fn send_icmp_echo(dest: IpAddr, payload: &[u8], timeout: Duration) -> io::Re
     }
 }
 
+fn sendto(sock: &Socket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
+    let sent = match dest {
+        IpAddr::V4(addr) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let dest_addr = libc::sockaddr_in {
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd"
+                ))]
+                sin_len: mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(addr).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::sendto(
+                    sock.as_fd(),
+                    packet.as_ptr().cast::<libc::c_void>(),
+                    packet.len(),
+                    0,
+                    (&raw const dest_addr).cast::<libc::sockaddr>(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+                    },
+                )
+            }
+        }
+        IpAddr::V6(addr) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let dest_addr = libc::sockaddr_in6 {
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd"
+                ))]
+                sin6_len: mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: addr.octets(),
+                },
+                sin6_scope_id: 0,
+            };
+            unsafe {
+                libc::sendto(
+                    sock.as_fd(),
+                    packet.as_ptr().cast::<libc::c_void>(),
+                    packet.len(),
+                    0,
+                    (&raw const dest_addr).cast::<libc::sockaddr>(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+                    },
+                )
+            }
+        }
+    };
+
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 /// Send an `ICMPv4` echo request with the given payload and return the round-trip time.
 #[allow(clippy::too_many_lines)]
 fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::Result<Duration> {
@@ -453,13 +529,14 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Build ICMP packet with timestamp
     let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
+    let our_id = get_echo_id();
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
         typ: ICMP_ECHO_REQUEST,
         code: 0,
         checksum: 0,
-        id: get_echo_id().to_be(),
+        id: our_id.to_be(),
         sequence: seq.to_be(),
     };
 
@@ -479,47 +556,11 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     packet[2] = (checksum >> 8) as u8;
     packet[3] = (checksum & 0xff) as u8;
 
-    // Prepare destination address
-    #[allow(clippy::cast_possible_truncation)]
-    let dest_addr = libc::sockaddr_in {
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        ))]
-        sin_len: mem::size_of::<libc::sockaddr_in>() as u8,
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 0,
-        sin_addr: libc::in_addr {
-            s_addr: u32::from(dest).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-
     // Send packet
-    let sent = unsafe {
-        libc::sendto(
-            sock.as_fd(),
-            packet.as_ptr().cast::<libc::c_void>(),
-            packet.len(),
-            0,
-            (&raw const dest_addr).cast::<libc::sockaddr>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-            },
-        )
-    };
-
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    sendto(&sock, &packet, IpAddr::V4(dest))?;
 
     // Receive response - loop to skip packets that aren't our echo reply
     // (raw sockets receive all ICMP packets, including our own echo request on loopback)
-    let our_id = get_echo_id();
     let recv_time;
     let mut recv_buf = vec![0u8; 1024];
     let icmp_start;
@@ -600,13 +641,14 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
 
     // Build ICMPv6 packet with timestamp
     let mut packet = Vec::with_capacity(8 + Timestamp::len() + payload.len());
+    let our_id = get_echo_id();
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
         typ: ICMP6_ECHO_REQUEST,
         code: 0,
         checksum: 0, // Kernel calculates checksum for ICMPv6
-        id: get_echo_id().to_be(),
+        id: our_id.to_be(),
         sequence: seq.to_be(),
     };
 
@@ -624,47 +666,10 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     // Note: For IPv6, the kernel automatically calculates the ICMPv6 checksum
     // so we don't need to calculate it ourselves
 
-    // Prepare destination address
-    #[allow(clippy::cast_possible_truncation)]
-    let dest_addr = libc::sockaddr_in6 {
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        ))]
-        sin6_len: mem::size_of::<libc::sockaddr_in6>() as u8,
-        sin6_family: libc::AF_INET6 as libc::sa_family_t,
-        sin6_port: 0,
-        sin6_flowinfo: 0,
-        sin6_addr: libc::in6_addr {
-            s6_addr: dest.octets(),
-        },
-        sin6_scope_id: 0,
-    };
-
     // Send packet
-    let sent = unsafe {
-        libc::sendto(
-            sock.as_fd(),
-            packet.as_ptr().cast::<libc::c_void>(),
-            packet.len(),
-            0,
-            (&raw const dest_addr).cast::<libc::sockaddr>(),
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-            },
-        )
-    };
-
-    if sent < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    sendto(&sock, &packet, IpAddr::V6(dest))?;
 
     // Receive response - loop to handle IPv6 raw sockets receiving own packets
-    let our_id = get_echo_id();
     let recv_time;
     let mut recv_buf = vec![0u8; 1024];
 
