@@ -206,6 +206,48 @@ struct IcmpHeader {
     sequence: u16,
 }
 
+impl IcmpHeader {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const IcmpHeader).cast::<u8>(),
+                mem::size_of::<IcmpHeader>(),
+            )
+        }
+    }
+
+    fn len() -> usize {
+        mem::size_of::<IcmpHeader>()
+    }
+}
+
+impl TryFrom<&[u8]> for IcmpHeader {
+    type Error = io::Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        if bytes.len() != mem::size_of::<IcmpHeader>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid ICMP header size: expected {}, got {}",
+                    mem::size_of::<IcmpHeader>(),
+                    bytes.len()
+                ),
+            ));
+        }
+
+        unsafe {
+            let mut header = mem::MaybeUninit::<IcmpHeader>::uninit();
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                header.as_mut_ptr().cast::<u8>(),
+                mem::size_of::<IcmpHeader>(),
+            );
+            Ok(header.assume_init())
+        }
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct Timestamp {
