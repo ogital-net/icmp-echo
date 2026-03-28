@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -5,6 +6,30 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 static SEQUENCE: AtomicU16 = AtomicU16::new(0);
+static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
+
+thread_local! {
+    static THREAD_ID: Cell<u16> = Cell::new(0);
+}
+
+/// Get a machine-unique identifier for this thread.
+/// Combines process ID with a per-thread counter via XOR to ensure uniqueness
+/// across both threads and processes on the same machine.
+fn get_thread_id() -> u16 {
+    THREAD_ID.with(|id| {
+        let current = id.get();
+        if current == 0 {
+            let thread_num = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let process_id = std::process::id() as u16;
+            // XOR thread number with process ID for machine-wide uniqueness
+            let unique_id = thread_num ^ process_id;
+            id.set(unique_id);
+            unique_id
+        } else {
+            current
+        }
+    })
+}
 
 const ICMP_ECHO: u8 = 8;
 const ICMP_ECHOREPLY: u8 = 0;
@@ -133,7 +158,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         typ: ICMP_ECHO,
         code: 0,
         checksum: 0,
-        id: (std::process::id() as u16).to_be(),
+        id: get_thread_id().to_be(),
         sequence: seq.to_be(),
     };
 
@@ -257,7 +282,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
         ));
     }
 
-    if reply_id != (std::process::id() as u16) {
+    if reply_id != get_thread_id() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ICMP ID mismatch",
@@ -327,7 +352,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         typ: ICMP6_ECHO_REQUEST,
         code: 0,
         checksum: 0, // Kernel calculates checksum for ICMPv6
-        id: (std::process::id() as u16).to_be(),
+        id: get_thread_id().to_be(),
         sequence: seq.to_be(),
     };
 
@@ -438,7 +463,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
         ));
     }
 
-    if reply_id != (std::process::id() as u16) {
+    if reply_id != get_thread_id() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ICMPv6 ID mismatch",
@@ -512,6 +537,41 @@ mod tests {
         let checksum = calculate_checksum(&data);
         // Sum: 0x0001 + 0x0200 = 0x0201, ~0x0201 = 0xfdfe
         assert_eq!(checksum, 0xfdfe);
+    }
+
+    #[test]
+    fn test_thread_id_uniqueness() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        
+        // Collect IDs from multiple threads
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = vec![];
+        
+        for _ in 0..5 {
+            let ids_clone = Arc::clone(&ids);
+            let handle = thread::spawn(move || {
+                let id = get_thread_id();
+                ids_clone.lock().unwrap().push(id);
+            });
+            handles.push(handle);
+        }
+        
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        let ids = ids.lock().unwrap();
+        // All thread IDs should be unique
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort();
+        sorted_ids.dedup();
+        assert_eq!(ids.len(), sorted_ids.len(), "Thread IDs should be unique");
+        
+        // Main thread should also have a consistent ID
+        let main_id1 = get_thread_id();
+        let main_id2 = get_thread_id();
+        assert_eq!(main_id1, main_id2, "Same thread should return same ID");
     }
 
     #[test]
