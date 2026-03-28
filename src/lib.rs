@@ -36,9 +36,9 @@ fn get_monotonic_time() -> io::Result<Timestamp> {
     let mut ts: libc::timespec = unsafe { mem::zeroed() };
 
     let result = unsafe {
-        #[cfg(target_os = "macos")]
-        let clock_id = libc::CLOCK_MONOTONIC;
-        #[cfg(target_os = "linux")]
+        #[cfg(target_vendor = "apple")]
+        let clock_id = libc::CLOCK_UPTIME_RAW;
+        #[cfg(not(target_vendor = "apple"))]
         let clock_id = libc::CLOCK_MONOTONIC;
 
         libc::clock_gettime(clock_id, &mut ts)
@@ -49,17 +49,17 @@ fn get_monotonic_time() -> io::Result<Timestamp> {
     }
 
     Ok(Timestamp {
-        sec: (ts.tv_sec as u32).to_be(),
-        nsec: (ts.tv_nsec as u32).to_be(),
+        sec: ts.tv_sec as u32,
+        nsec: ts.tv_nsec as u32,
     })
 }
 
 /// Calculate duration between two monotonic timestamps.
 fn calculate_duration(start: &Timestamp, end: &Timestamp) -> Duration {
-    let start_sec = u32::from_be(start.sec) as u64;
-    let start_nsec = u32::from_be(start.nsec) as u64;
-    let end_sec = u32::from_be(end.sec) as u64;
-    let end_nsec = u32::from_be(end.nsec) as u64;
+    let start_sec = start.sec as u64;
+    let start_nsec = start.nsec as u64;
+    let end_sec = end.sec as u64;
+    let end_nsec = end.nsec as u64;
 
     let start_total_nsec = start_sec * 1_000_000_000 + start_nsec;
     let end_total_nsec = end_sec * 1_000_000_000 + end_nsec;
@@ -500,11 +500,94 @@ mod tests {
 
     #[test]
     fn test_checksum() {
-        // Test with known values
-        let data = vec![0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00];
+        // Test with known ICMP echo request header (checksum field zeroed)
+        // Type=8, Code=0, Checksum=0, ID=0, Sequence=0
+        let data = vec![0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let checksum = calculate_checksum(&data);
-        // Just verify it produces a value (specific value depends on full packet)
-        assert!(checksum > 0);
+        // Expected: ~(0x0800) = 0xf7ff
+        assert_eq!(checksum, 0xf7ff);
+        
+        // Test with odd length data
+        let data = vec![0x00, 0x01, 0x02];
+        let checksum = calculate_checksum(&data);
+        // Sum: 0x0001 + 0x0200 = 0x0201, ~0x0201 = 0xfdfe
+        assert_eq!(checksum, 0xfdfe);
+    }
+
+    #[test]
+    fn test_get_monotonic_time() {
+        // Test that we can get a monotonic timestamp
+        let ts1 = get_monotonic_time().expect("Failed to get monotonic time");
+        
+        // Verify fields are reasonable (not zero and not maxed out)
+        assert!(ts1.sec > 0, "Seconds should be non-zero");
+        assert!(ts1.nsec < 1_000_000_000, "Nanoseconds should be less than 1 billion");
+        
+        // Get another timestamp and verify time moves forward
+        std::thread::sleep(Duration::from_millis(10));
+        let ts2 = get_monotonic_time().expect("Failed to get monotonic time");
+        
+        // Second timestamp should be greater than first
+        let total1 = (ts1.sec as u64) * 1_000_000_000 + (ts1.nsec as u64);
+        let total2 = (ts2.sec as u64) * 1_000_000_000 + (ts2.nsec as u64);
+        assert!(total2 > total1, "Monotonic time should increase");
+    }
+
+    #[test]
+    fn test_calculate_duration() {
+        // Test basic duration calculation
+        let start = Timestamp { sec: 10, nsec: 500_000_000 };
+        let end = Timestamp { sec: 12, nsec: 250_000_000 };
+        
+        let duration = calculate_duration(&start, &end);
+        
+        // Should be 1.75 seconds (12.25 - 10.5)
+        assert_eq!(duration.as_secs(), 1);
+        assert_eq!(duration.subsec_nanos(), 750_000_000);
+    }
+
+    #[test]
+    fn test_calculate_duration_same_second() {
+        // Test duration within same second
+        let start = Timestamp { sec: 5, nsec: 100_000_000 };
+        let end = Timestamp { sec: 5, nsec: 300_000_000 };
+        
+        let duration = calculate_duration(&start, &end);
+        
+        // Should be 200ms
+        assert_eq!(duration.as_millis(), 200);
+    }
+
+    #[test]
+    fn test_calculate_duration_zero() {
+        // Test zero duration
+        let ts = Timestamp { sec: 10, nsec: 500_000_000 };
+        
+        let duration = calculate_duration(&ts, &ts);
+        
+        assert_eq!(duration.as_nanos(), 0);
+    }
+
+    #[test]
+    fn test_calculate_duration_backwards() {
+        // Test that backwards time gives zero (shouldn't happen with monotonic clock)
+        let start = Timestamp { sec: 12, nsec: 500_000_000 };
+        let end = Timestamp { sec: 10, nsec: 250_000_000 };
+        
+        let duration = calculate_duration(&start, &end);
+        
+        assert_eq!(duration.as_nanos(), 0);
+    }
+
+    #[test]
+    fn test_calculate_duration_microsecond_precision() {
+        // Test microsecond-level precision
+        let start = Timestamp { sec: 0, nsec: 1_000 };
+        let end = Timestamp { sec: 0, nsec: 2_000 };
+        
+        let duration = calculate_duration(&start, &end);
+        
+        assert_eq!(duration.as_nanos(), 1_000);
     }
 
     #[test]
