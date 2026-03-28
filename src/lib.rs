@@ -291,7 +291,7 @@ impl Timestamp {
         unsafe {
             std::slice::from_raw_parts(
                 (self as *const Timestamp).cast::<u8>(),
-                mem::size_of::<Timestamp>(),
+                Timestamp::len(),
             )
         }
     }
@@ -306,12 +306,12 @@ impl TryFrom<&[u8]> for Timestamp {
     type Error = io::Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        if bytes.len() != mem::size_of::<Timestamp>() {
+        if bytes.len() != Timestamp::len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "Invalid timestamp size: expected {}, got {}",
-                    mem::size_of::<Timestamp>(),
+                    Timestamp::len(),
                     bytes.len()
                 ),
             ));
@@ -322,7 +322,7 @@ impl TryFrom<&[u8]> for Timestamp {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 ts.as_mut_ptr().cast::<u8>(),
-                mem::size_of::<Timestamp>(),
+                Timestamp::len(),
             );
             Ok(ts.assume_init())
         }
@@ -465,7 +465,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     let sock = create_socket(Domain::Ipv4, timeout)?;
 
     // Build ICMP packet with timestamp
-    let timestamp_size = mem::size_of::<Timestamp>();
+    let timestamp_size = Timestamp::len();
     let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -478,13 +478,7 @@ fn send_icmp_echo_v4(dest: Ipv4Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     // Add header to packet
-    unsafe {
-        let header_bytes = std::slice::from_raw_parts(
-            (&raw const header).cast::<u8>(),
-            mem::size_of::<IcmpHeader>(),
-        );
-        packet.extend_from_slice(header_bytes);
-    }
+    packet.extend_from_slice(header.as_bytes());
 
     // Encode current monotonic time as timestamp (before user payload)
     let timestamp = Timestamp::now();
@@ -619,7 +613,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     let sock = create_socket(Domain::Ipv6, timeout)?;
 
     // Build ICMPv6 packet with timestamp
-    let timestamp_size = mem::size_of::<Timestamp>();
+    let timestamp_size = Timestamp::len();
     let mut packet = Vec::with_capacity(8 + timestamp_size + payload.len());
 
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -632,13 +626,7 @@ fn send_icmp_echo_v6(dest: Ipv6Addr, payload: &[u8], timeout: Duration) -> io::R
     };
 
     // Add header to packet
-    unsafe {
-        let header_bytes = std::slice::from_raw_parts(
-            (&raw const header).cast::<u8>(),
-            mem::size_of::<IcmpHeader>(),
-        );
-        packet.extend_from_slice(header_bytes);
-    }
+    packet.extend_from_slice(header.as_bytes());
 
     // Encode current monotonic time as timestamp (before user payload)
     let timestamp = Timestamp::now();
