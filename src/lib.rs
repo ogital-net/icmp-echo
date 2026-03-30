@@ -680,7 +680,11 @@ fn sendto(sock: &IcmpSocket, packet: &[u8], dest: IpAddr) -> io::Result<()> {
 /// `sock` must be an IPv4 ICMP socket (i.e. created with [`IcmpSocket::new_v4`]).
 /// Passing an IPv6 socket results in undefined behaviour at the `sendto`/`recvfrom` level.
 #[allow(clippy::too_many_lines)]
-pub fn send_icmp_echo_v4(sock: &IcmpSocket, dest: Ipv4Addr, payload: &[u8]) -> io::Result<Duration> {
+pub fn send_icmp_echo_v4(
+    sock: &IcmpSocket,
+    dest: Ipv4Addr,
+    payload: &[u8],
+) -> io::Result<Duration> {
     let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
     let checksum = calculate_checksum(&packet);
     packet[2] = (checksum >> 8) as u8;
@@ -770,7 +774,11 @@ pub fn send_icmp_echo_v4(sock: &IcmpSocket, dest: Ipv4Addr, payload: &[u8]) -> i
 /// `sock` must be an IPv6 ICMPv6 socket (i.e. created with [`IcmpSocket::new_v6`]).
 /// Passing an IPv4 socket results in undefined behaviour at the `sendto`/`recvfrom` level.
 #[allow(clippy::too_many_lines)]
-pub fn send_icmp_echo_v6(sock: &IcmpSocket, dest: Ipv6Addr, payload: &[u8]) -> io::Result<Duration> {
+pub fn send_icmp_echo_v6(
+    sock: &IcmpSocket,
+    dest: Ipv6Addr,
+    payload: &[u8],
+) -> io::Result<Duration> {
     // Note: For IPv6 the kernel automatically computes the ICMPv6 checksum.
     let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
@@ -899,8 +907,8 @@ fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, Vec<u8>) {
 #[cfg(feature = "tokio")]
 mod async_impl {
     use super::{
-        build_icmp_packet, calculate_checksum, sendto, IcmpSocket, Timestamp,
-        ICMP6_ECHO_REPLY, ICMP6_ECHO_REQUEST, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
+        build_icmp_packet, calculate_checksum, sendto, IcmpSocket, Timestamp, ICMP6_ECHO_REPLY,
+        ICMP6_ECHO_REQUEST, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
     };
     use crate::generate_payload;
     use std::io;

@@ -1,4 +1,4 @@
-use icmp_echo::{IcmpSocket, send_icmp_echo_v4, send_icmp_echo_v6};
+use icmp_echo::{send_icmp_echo_v4, send_icmp_echo_v6, IcmpSocket};
 use std::env;
 use std::net::IpAddr;
 use std::time::Duration;
