@@ -184,7 +184,7 @@ impl Drop for IcmpSocket {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "std"))]
 impl std::os::unix::io::AsRawFd for IcmpSocket {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.0
