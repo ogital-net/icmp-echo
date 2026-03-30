@@ -685,7 +685,7 @@ pub fn send_icmp_echo_v4(
     dest: Ipv4Addr,
     payload: &[u8],
 ) -> io::Result<Duration> {
-    let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
+    let (our_id, our_seq, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
     let checksum = calculate_checksum(&packet);
     packet[2] = (checksum >> 8) as u8;
     packet[3] = (checksum & 0xff) as u8;
@@ -735,12 +735,13 @@ pub fn send_icmp_echo_v4(
 
         let reply_type = recv_buf[ip_hlen];
         let reply_id = u16::from_be_bytes([recv_buf[ip_hlen + 4], recv_buf[ip_hlen + 5]]);
+        let reply_seq = u16::from_be_bytes([recv_buf[ip_hlen + 6], recv_buf[ip_hlen + 7]]);
 
         if reply_type != ICMP_ECHO_REPLY {
             continue; // Not an echo reply, wait for next packet
         }
 
-        if reply_id != our_id {
+        if reply_id != our_id || reply_seq != our_seq {
             continue; // Not our packet, wait for next packet
         }
 
@@ -780,7 +781,7 @@ pub fn send_icmp_echo_v6(
     payload: &[u8],
 ) -> io::Result<Duration> {
     // Note: For IPv6 the kernel automatically computes the ICMPv6 checksum.
-    let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
+    let (our_id, our_seq, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
     // Send packet
     sendto(&sock, &packet, IpAddr::V6(dest))?;
@@ -818,13 +819,14 @@ pub fn send_icmp_echo_v6(
         // Parse ICMPv6 header from response
         let reply_type = recv_buf[0];
         let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
+        let reply_seq = u16::from_be_bytes([recv_buf[6], recv_buf[7]]);
 
         // Skip packets that aren't echo replies or aren't for us
         if reply_type != ICMP6_ECHO_REPLY {
             continue; // Not an echo reply, wait for next packet
         }
 
-        if reply_id != our_id {
+        if reply_id != our_id || reply_seq != our_seq {
             continue; // Not our packet, wait for next packet
         }
 
@@ -883,10 +885,10 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 
 /// Build an ICMP/ICMPv6 echo-request packet.
 ///
-/// Returns `(echo_id, packet)`. The caller is responsible for computing and
-/// writing the ICMPv4 checksum when needed (ICMPv6 checksums are handled by
-/// the kernel).
-fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, Vec<u8>) {
+/// Returns `(echo_id, sequence, packet)`. The caller is responsible for
+/// computing and writing the ICMPv4 checksum when needed (ICMPv6 checksums
+/// are handled by the kernel).
+fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, u16, Vec<u8>) {
     let our_id = get_echo_id();
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let header = IcmpHeader {
@@ -900,7 +902,7 @@ fn build_icmp_packet(typ: u8, payload: &[u8]) -> (u16, Vec<u8>) {
     packet.extend_from_slice(header.as_bytes());
     packet.extend_from_slice(Timestamp::now().as_bytes());
     packet.extend_from_slice(payload);
-    (our_id, packet)
+    (our_id, seq, packet)
 }
 
 /// Async implementation backed by tokio.
@@ -931,7 +933,7 @@ mod async_impl {
         payload: &[u8],
         tout: Duration,
     ) -> io::Result<Duration> {
-        let (our_id, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
+        let (our_id, our_seq, mut packet) = build_icmp_packet(ICMP_ECHO_REQUEST, payload);
         let checksum = calculate_checksum(&packet);
         packet[2] = (checksum >> 8) as u8;
         packet[3] = (checksum & 0xff) as u8;
@@ -982,7 +984,8 @@ mod async_impl {
                 }
                 let reply_type = recv_buf[ip_hlen];
                 let reply_id = u16::from_be_bytes([recv_buf[ip_hlen + 4], recv_buf[ip_hlen + 5]]);
-                if reply_type != ICMP_ECHO_REPLY || reply_id != our_id {
+                let reply_seq = u16::from_be_bytes([recv_buf[ip_hlen + 6], recv_buf[ip_hlen + 7]]);
+                if reply_type != ICMP_ECHO_REPLY || reply_id != our_id || reply_seq != our_seq {
                     guard.clear_ready();
                     continue;
                 }
@@ -1017,7 +1020,7 @@ mod async_impl {
         payload: &[u8],
         tout: Duration,
     ) -> io::Result<Duration> {
-        let (our_id, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
+        let (our_id, our_seq, packet) = build_icmp_packet(ICMP6_ECHO_REQUEST, payload);
 
         loop {
             let mut guard = afd.writable().await?;
@@ -1058,7 +1061,8 @@ mod async_impl {
                 }
                 let reply_type = recv_buf[0];
                 let reply_id = u16::from_be_bytes([recv_buf[4], recv_buf[5]]);
-                if reply_type != ICMP6_ECHO_REPLY || reply_id != our_id {
+                let reply_seq = u16::from_be_bytes([recv_buf[6], recv_buf[7]]);
+                if reply_type != ICMP6_ECHO_REPLY || reply_id != our_id || reply_seq != our_seq {
                     guard.clear_ready();
                     continue;
                 }
