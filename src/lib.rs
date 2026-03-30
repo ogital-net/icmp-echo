@@ -698,13 +698,14 @@ pub fn send_icmp_echo_v4(
     let recv_time;
     let mut recv_buf = [0u8; 1024];
     let icmp_start;
+    let received;
 
     loop {
         let mut src_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
         #[allow(clippy::cast_possible_truncation)]
         let mut src_addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
-        let received = unsafe {
+        let n = unsafe {
             libc::recvfrom(
                 sock.as_fd(),
                 recv_buf.as_mut_ptr().cast::<libc::c_void>(),
@@ -715,13 +716,13 @@ pub fn send_icmp_echo_v4(
             )
         };
 
-        if received < 0 {
+        if n < 0 {
             return Err(io::Error::last_os_error());
         }
 
         // IP header is 20 bytes, ICMP follows
         #[allow(clippy::cast_sign_loss)]
-        if (received as usize) < 28 {
+        if (n as usize) < 28 {
             continue; // Too short, wait for next packet
         }
 
@@ -729,7 +730,7 @@ pub fn send_icmp_echo_v4(
         let ip_hlen = ((recv_buf[0] & 0x0f) * 4) as usize;
 
         #[allow(clippy::cast_sign_loss)]
-        if (received as usize) < ip_hlen + 8 {
+        if (n as usize) < ip_hlen + 8 {
             continue; // Truncated header, wait for next packet
         }
 
@@ -747,6 +748,10 @@ pub fn send_icmp_echo_v4(
         // Found our echo reply
         recv_time = Timestamp::now();
         icmp_start = ip_hlen;
+        #[allow(clippy::cast_sign_loss)]
+        {
+            received = n as usize;
+        }
         break;
     }
 
@@ -754,7 +759,7 @@ pub fn send_icmp_echo_v4(
     let timestamp_offset = icmp_start + 8; // After ICMP header
     let timestamp_size = Timestamp::len();
 
-    if recv_buf.len() >= timestamp_offset + timestamp_size {
+    if received >= timestamp_offset + timestamp_size {
         let ts =
             Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
@@ -788,13 +793,14 @@ pub fn send_icmp_echo_v6(
     // Receive response - loop to handle IPv6 raw sockets receiving own packets
     let recv_time;
     let mut recv_buf = [0u8; 1024];
+    let received;
 
     loop {
         let mut src_addr: libc::sockaddr_in6 = unsafe { mem::zeroed() };
         #[allow(clippy::cast_possible_truncation)]
         let mut src_addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
 
-        let received = unsafe {
+        let n = unsafe {
             libc::recvfrom(
                 sock.as_fd(),
                 recv_buf.as_mut_ptr().cast::<libc::c_void>(),
@@ -805,13 +811,13 @@ pub fn send_icmp_echo_v6(
             )
         };
 
-        if received < 0 {
+        if n < 0 {
             return Err(io::Error::last_os_error());
         }
 
         // Parse ICMPv6 response (no IP header for ICMPv6 raw sockets)
         #[allow(clippy::cast_sign_loss)]
-        if (received as usize) < 8 {
+        if (n as usize) < 8 {
             continue; // Too short, wait for next packet
         }
 
@@ -830,6 +836,10 @@ pub fn send_icmp_echo_v6(
 
         // Found our echo reply!
         recv_time = Timestamp::now();
+        #[allow(clippy::cast_sign_loss)]
+        {
+            received = n as usize;
+        }
         break;
     }
 
@@ -838,7 +848,7 @@ pub fn send_icmp_echo_v6(
     let timestamp_size = Timestamp::len();
 
     // Extract timestamp from packet
-    if recv_buf.len() >= timestamp_offset + timestamp_size {
+    if received >= timestamp_offset + timestamp_size {
         let ts =
             Timestamp::try_from(&recv_buf[timestamp_offset..timestamp_offset + timestamp_size])?;
 
